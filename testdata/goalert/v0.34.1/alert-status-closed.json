@@ -1,0 +1,7 @@
+{
+  "AppName": "MS OnCall Fixture",
+  "Type": "AlertStatus",
+  "AlertID": 4242,
+  "LogEntry": "Closed via Fixture Grafana integration (Grafana)",
+  "AlertState": "Closed"
+}

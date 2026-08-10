@@ -1,0 +1,13 @@
+{
+  "AppName": "MS OnCall Fixture",
+  "Type": "Alert",
+  "AlertID": 4242,
+  "Summary": "Synthetic CPU saturation alert",
+  "Details": "**Synthetic alert details**\n\n- instance: `fixture-host.invalid:9100`\n- value: `95`",
+  "ServiceID": "11111111-2222-4333-8444-555555555555",
+  "ServiceName": "Fixture Service",
+  "Meta": {
+    "environment": "fixture",
+    "fixture_origin": "sanitized-goalert-v0.34.1"
+  }
+}

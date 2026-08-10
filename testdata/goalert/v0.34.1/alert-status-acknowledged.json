@@ -1,0 +1,7 @@
+{
+  "AppName": "MS OnCall Fixture",
+  "Type": "AlertStatus",
+  "AlertID": 4242,
+  "LogEntry": "Acknowledged by Fixture User (Web)",
+  "AlertState": "Acknowledged"
+}
