@@ -43,6 +43,7 @@ case-sensitive exported Go field names shown below.
 | Content encoding | Absent or `identity`; compressed request bodies are rejected |
 | Maximum body | 262,144 raw bytes (256 KiB), enforced while reading as well as against `Content-Length` |
 | Query string | Must be empty; destinations and credentials are never query parameters |
+| Delivery identity | Exactly one `Idempotency-Key` header containing the canonical UUID from Core's persisted `outgoing_messages.id` |
 
 The 256 KiB limit covers the v0.34.1 alert limits (1,024 Unicode code points
 for summary, 6,144 for details, and 32 KiB of metadata key/value bytes) plus
@@ -57,6 +58,13 @@ not sufficient request authentication.
 Core v0.34.1 has a three-second webhook request timeout. Gateway intake MUST
 not wait for provider delivery. This timeout is a compatibility constraint,
 not permission to acknowledge an event before durable acceptance.
+
+`Idempotency-Key` identifies one logical Core delivery, not one HTTP attempt.
+Core MUST reuse the same value for every attempt and durable retry of one
+`outgoing_messages` row. Core MUST fail the send before invoking its HTTP
+client when the delivery identity is missing; it MUST NOT generate a fallback
+UUID or substitute an alert ID, destination token, payload hash, timestamp, or
+attempt-specific value.
 
 ## JSON parsing rules
 
@@ -73,6 +81,8 @@ The request body MUST be one UTF-8 JSON object.
 - Validation occurs before a delivery job is inserted.
 - The Gateway MUST NOT use `AppName`, `AlertID`, `ServiceID`, `Summary`,
   `Meta`, or `LogEntry` as authentication or delivery identity.
+- Delivery identity is carried only in `Idempotency-Key`; it MUST NOT be added
+  to the JSON object. The existing JSON fixtures therefore remain unchanged.
 
 Unknown top-level fields are rejected deliberately. A new Core field requires
 an explicit v1 contract update and receiver coverage rather than being silently
@@ -180,13 +190,29 @@ Regardless of the selected mechanism:
 
 ## Delivery identity and idempotency
 
-### Confirmed current limitation
+### Owner-approved wire binding
 
-Each Core `outgoing_messages` row has a stable UUID. It is propagated to the
-internal notification message as `msg.MsgID()`, but
-`notification/webhook/sender.go` does not serialize it into the JSON payload
-or an HTTP header. Consequently, the checked-out Core v0.34.1 wire request has
-no stable delivery identity.
+The project owner approved `Idempotency-Key` as the delivery-identity header.
+Its value is the existing persisted `outgoing_messages.id`, serialized as the
+canonical hyphenated UUID string.
+
+Core propagates the value without replacement through the existing internal
+message envelope: the queue reads `outgoing_messages.id` into
+`engine/message.Message.ID`, `Message.Base()` copies it into
+`nfymsg.Base.ID`, and `msg.MsgID()` exposes it to the webhook sender. The
+sender sets that exact value as `Idempotency-Key`.
+
+- Every HTTP attempt for one logical outgoing message uses the same key.
+- Different `outgoing_messages` rows use different keys because `id` is the
+  row's UUID primary key.
+- A missing or empty key is invalid and MUST NOT be sent by Core or accepted
+  by Gateway.
+- No component may generate a fallback key or derive one from `AlertID`, the
+  opaque destination token, the JSON body, a payload hash, a timestamp, or an
+  individual HTTP attempt.
+- The key is correlation and deduplication data, not authentication.
+- The JSON payload is byte-for-byte independent of the delivery identity; the
+  five v0.34.1 JSON fixtures do not gain a delivery-ID field.
 
 `AlertID`, the destination token, and a hash of the body are not safe
 substitutes:
@@ -199,10 +225,9 @@ substitutes:
 The body hash MUST be used only as a conflict fingerprint after a stable
 delivery identity is available, never as the identity itself.
 
-### Target idempotency model
+### Idempotency model
 
-Once Core supplies a stable delivery identity, Gateway acceptance uses a
-durable uniqueness key composed of:
+Gateway acceptance uses a durable uniqueness key composed of:
 
 1. the authenticated Core principal;
 2. the resolved internal destination ID; and
@@ -220,10 +245,9 @@ digest of the validated, canonical typed event.
 - The Gateway-generated receipt ID identifies the durable Gateway job. It does
   not replace the Core delivery identity.
 
-The wire location of the Core delivery identity and the handling of current
-no-ID requests require owner decisions. An implementation MUST NOT silently
-invent a random ID or body-hash deduplication fallback and claim reliable
-idempotency.
+Gateway MUST reject an absent, empty, malformed, or repeated
+`Idempotency-Key`; it MUST NOT silently invent a random ID or use body-hash
+deduplication as a fallback.
 
 ## Reliable acceptance and `202 Accepted`
 
@@ -233,7 +257,7 @@ Gateway may return `202 Accepted` only after all of the following are true:
 2. the opaque token resolved to an enabled internal destination;
 3. the complete body was read within the limit and the typed event validated;
 4. the durable acceptance transaction committed the job, routing reference,
-   delivery identity (when available), and payload digest; or
+   delivery identity, and payload digest; or
 5. a committed record proved that the same delivery identity and payload had
    already been accepted.
 
@@ -280,7 +304,7 @@ destinations, verification codes, or event field values.
 | Status | Meaning |
 | --- | --- |
 | `202 Accepted` | A new job is durably committed, or an identical delivery identity was already durably accepted |
-| `400 Bad Request` | Malformed/ambiguous JSON, invalid field type or value, missing/extra field, duplicate key, non-empty query string, or trailing data |
+| `400 Bad Request` | Missing, empty, malformed, or repeated `Idempotency-Key`; malformed/ambiguous JSON; invalid field type or value; missing/extra field; duplicate JSON key; non-empty query string; or trailing data |
 | `401 Unauthorized` | Core authentication is missing or invalid |
 | `403 Forbidden` | The authenticated principal lacks intake authorization |
 | `404 Not Found` | The authenticated request names an unknown or disabled opaque destination; response remains generic |
@@ -293,10 +317,10 @@ destinations, verification codes, or event field values.
 | `500 Internal Server Error` | Unexpected failure before reliable acceptance |
 | `503 Service Unavailable` | Durable acceptance is unavailable or cannot be confirmed; include `Retry-After` when known |
 
-Confirmed Core interoperability risk: the current v0.34.1 sender does not
-treat non-2xx responses as send failures. Until the separately scoped Core
-reliability work is completed, these error responses do not guarantee a Core
-retry and message loss remains possible.
+The accepted Core transport-correctness checkpoint treats every non-2xx
+response as a send failure and feeds the error into Core's existing retry
+path. The three-second sender timeout and existing retry/backoff behavior are
+unchanged.
 
 ## Sensitive data and logging
 
@@ -326,23 +350,19 @@ destinations, summaries, or log entries as labels.
 The project owner must decide the following before the affected behavior is
 implemented:
 
+The `Idempotency-Key: <outgoing_messages.id>` delivery-identity binding and
+the prohibition on no-ID sends are approved and are no longer decision items.
+
 1. **Core authentication mechanism.** Select mTLS identity, a signed request
    scheme, a narrowly scoped bearer credential, or an approved combination.
    The opaque destination token alone is explicitly insufficient.
-2. **Delivery identity wire binding and legacy behavior.** Approve where Core's
-   existing `outgoing_messages.id` UUID is carried. The recommended binding is
-   an `Idempotency-Key` request header so the current JSON shape stays
-   compatible. Also decide whether no-ID v0.34.1 requests are rejected
-   (recommended for reliable operation) or allowed only in an explicitly
-   non-production compatibility mode that accepts possible duplicate
-   notifications.
-3. **Explicit alert state.** Decide whether Core will add a machine-readable
+2. **Explicit alert state.** Decide whether Core will add a machine-readable
    state such as `Acknowledged` or `Closed` to `AlertStatus`. This is
    recommended; parsing `LogEntry` is prohibited.
-4. **Additional Core event types.** Confirm that `AlertBundle` and
+3. **Additional Core event types.** Confirm that `AlertBundle` and
    `ScheduleOnCallUsers` remain rejected for the Gateway MVP, or approve
    schemas and fixtures for them.
-5. **Opaque token lifecycle.** Define token generation entropy, storage,
+4. **Opaque token lifecycle.** Define token generation entropy, storage,
    rotation, revocation, and overlap behavior. No token format is selected by
    this contract.
 
