@@ -177,8 +177,14 @@ func requiredString(fields map[string]json.RawMessage, name string) (string, err
 	if !ok {
 		return "", errInvalidEvent
 	}
-	trimmed := bytes.TrimSpace(raw)
+	return decodeJSONString(bytes.TrimSpace(raw))
+}
+
+func decodeJSONString(trimmed []byte) (string, error) {
 	if len(trimmed) == 0 || trimmed[0] != '"' {
+		return "", errInvalidEvent
+	}
+	if !validSurrogateEscapes(trimmed) {
 		return "", errInvalidEvent
 	}
 	var value string
@@ -186,6 +192,40 @@ func requiredString(fields map[string]json.RawMessage, name string) (string, err
 		return "", errInvalidEvent
 	}
 	return value, nil
+}
+
+func validSurrogateEscapes(data []byte) bool {
+	for i := 1; i < len(data)-1; i++ {
+		if data[i] != '\\' {
+			continue
+		}
+		i++
+		if i >= len(data)-1 || data[i] != 'u' {
+			continue
+		}
+		if i+4 >= len(data) {
+			return false
+		}
+		value, err := strconv.ParseUint(string(data[i+1:i+5]), 16, 16)
+		if err != nil {
+			return false
+		}
+		i += 4
+		switch {
+		case value >= 0xd800 && value <= 0xdbff:
+			if i+6 >= len(data) || data[i+1] != '\\' || data[i+2] != 'u' {
+				return false
+			}
+			low, err := strconv.ParseUint(string(data[i+3:i+7]), 16, 16)
+			if err != nil || low < 0xdc00 || low > 0xdfff {
+				return false
+			}
+			i += 6
+		case value >= 0xdc00 && value <= 0xdfff:
+			return false
+		}
+	}
+	return true
 }
 
 func requiredPositiveInt(fields map[string]json.RawMessage, name string) (int64, error) {
@@ -213,15 +253,21 @@ func requiredMeta(fields map[string]json.RawMessage, name string) (map[string]st
 	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return nil, errInvalidEvent
 	}
-	var meta map[string]string
-	if err := json.Unmarshal(trimmed, &meta); err != nil || meta == nil {
+	var rawMeta map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMeta); err != nil || rawMeta == nil {
 		return nil, errInvalidEvent
 	}
+	meta := make(map[string]string, len(rawMeta))
 	var size int
-	for key, value := range meta {
+	for key, rawValue := range rawMeta {
 		if len(key) < 1 || len(key) > 255 || !printableASCII(key) {
 			return nil, errInvalidEvent
 		}
+		value, err := decodeJSONString(bytes.TrimSpace(rawValue))
+		if err != nil {
+			return nil, errInvalidEvent
+		}
+		meta[key] = value
 		size += len(key) + len(value)
 		if size > 32768 {
 			return nil, errInvalidEvent

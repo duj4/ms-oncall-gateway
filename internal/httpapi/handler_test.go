@@ -63,6 +63,15 @@ func webhookRequest(method string, body []byte) *http.Request {
 	return req
 }
 
+func alertRequestBody(summary, details, meta string) []byte {
+	return []byte(fmt.Sprintf(
+		`{"AppName":"MS OnCall","Type":"Alert","AlertID":7,"Summary":%s,"Details":%s,"ServiceID":"11111111-2222-4333-8444-555555555555","ServiceName":"Fixture Service","Meta":%s}`,
+		summary,
+		details,
+		meta,
+	))
+}
+
 func perform(handler http.Handler, req *http.Request) *httptest.ResponseRecorder {
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, req)
@@ -227,6 +236,151 @@ func TestInvalidAlertStateDoesNotCallSink(t *testing.T) {
 				t.Errorf("sink calls = %d, want 0", calls)
 			}
 		})
+	}
+}
+
+func TestMetaValuesMustBeStrings(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "null", value: `null`},
+		{name: "number", value: `42`},
+		{name: "boolean", value: `true`},
+		{name: "array", value: `[]`},
+		{name: "object", value: `{}`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			sink := acceptingSink()
+			body := alertRequestBody(`"summary"`, `"details"`, `{"key":`+test.value+`}`)
+			response := perform(NewHandler(sink, nil), webhookRequest(http.MethodPost, body))
+			if response.Code != http.StatusBadRequest {
+				t.Errorf("status = %d, want 400; body=%s", response.Code, response.Body.String())
+			}
+			if calls := len(sink.snapshot()); calls != 0 {
+				t.Errorf("sink calls = %d, want 0", calls)
+			}
+		})
+	}
+
+	sink := acceptingSink()
+	body := alertRequestBody(`"summary"`, `"details"`, `{"key":""}`)
+	response := perform(NewHandler(sink, nil), webhookRequest(http.MethodPost, body))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("empty string status = %d, want 202; body=%s", response.Code, response.Body.String())
+	}
+	delivery := sink.snapshot()[0]
+	event, ok := delivery.Event.(AlertEvent)
+	if !ok {
+		t.Fatalf("event type = %T, want AlertEvent", delivery.Event)
+	}
+	if value, ok := event.Meta["key"]; !ok || value != "" {
+		t.Errorf("Meta key = (%q, %t), want present empty string", value, ok)
+	}
+}
+
+func TestLossyUnicodeEscapesDoNotCallSink(t *testing.T) {
+	surrogates := []struct {
+		name  string
+		value string
+	}{
+		{name: "lone high surrogate", value: `"\uD800"`},
+		{name: "lone low surrogate", value: `"\uDC00"`},
+	}
+	fields := []struct {
+		name string
+		body func(string) []byte
+	}{
+		{
+			name: "Summary",
+			body: func(value string) []byte {
+				return alertRequestBody(value, `"details"`, `{}`)
+			},
+		},
+		{
+			name: "Details",
+			body: func(value string) []byte {
+				return alertRequestBody(`"summary"`, value, `{}`)
+			},
+		},
+		{
+			name: "Meta value",
+			body: func(value string) []byte {
+				return alertRequestBody(`"summary"`, `"details"`, `{"key":`+value+`}`)
+			},
+		},
+		{
+			name: "LogEntry",
+			body: func(value string) []byte {
+				return []byte(`{"AppName":"MS OnCall","Type":"AlertStatus","AlertID":7,"LogEntry":` + value + `,"AlertState":"Acknowledged"}`)
+			},
+		},
+	}
+
+	for _, field := range fields {
+		for _, surrogate := range surrogates {
+			t.Run(field.name+"/"+surrogate.name, func(t *testing.T) {
+				sink := acceptingSink()
+				response := perform(NewHandler(sink, nil), webhookRequest(http.MethodPost, field.body(surrogate.value)))
+				if response.Code != http.StatusBadRequest {
+					t.Errorf("status = %d, want 400; body=%s", response.Code, response.Body.String())
+				}
+				if calls := len(sink.snapshot()); calls != 0 {
+					t.Errorf("sink calls = %d, want 0", calls)
+				}
+			})
+		}
+	}
+}
+
+func TestValidSurrogatePairsArePreserved(t *testing.T) {
+	const escapedEmoji = `"\uD83D\uDE00"`
+
+	alertSink := acceptingSink()
+	alertBody := alertRequestBody(escapedEmoji, escapedEmoji, `{"key":`+escapedEmoji+`}`)
+	response := perform(NewHandler(alertSink, nil), webhookRequest(http.MethodPost, alertBody))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("Alert status = %d, want 202; body=%s", response.Code, response.Body.String())
+	}
+	alertEvent, ok := alertSink.snapshot()[0].Event.(AlertEvent)
+	if !ok {
+		t.Fatalf("event type = %T, want AlertEvent", alertSink.snapshot()[0].Event)
+	}
+	if alertEvent.Summary != "😀" || alertEvent.Details != "😀" || alertEvent.Meta["key"] != "😀" {
+		t.Errorf("valid surrogate pair changed: %#v", alertEvent)
+	}
+
+	statusSink := acceptingSink()
+	statusBody := []byte(`{"AppName":"MS OnCall","Type":"AlertStatus","AlertID":7,"LogEntry":` + escapedEmoji + `,"AlertState":"Closed"}`)
+	response = perform(NewHandler(statusSink, nil), webhookRequest(http.MethodPost, statusBody))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("AlertStatus status = %d, want 202; body=%s", response.Code, response.Body.String())
+	}
+	statusEvent, ok := statusSink.snapshot()[0].Event.(AlertStatusEvent)
+	if !ok {
+		t.Fatalf("event type = %T, want AlertStatusEvent", statusSink.snapshot()[0].Event)
+	}
+	if statusEvent.LogEntry != "😀" {
+		t.Errorf("LogEntry = %q, want emoji", statusEvent.LogEntry)
+	}
+}
+
+func TestDecodeJSONStringRejectsUnpairedSurrogates(t *testing.T) {
+	for _, raw := range []string{`"\uD800"`, `"\uDC00"`, `"\uD800\u0041"`} {
+		if _, err := decodeJSONString([]byte(raw)); !errors.Is(err, errInvalidEvent) {
+			t.Errorf("decodeJSONString(%s) error = %v, want invalid event", raw, err)
+		}
+	}
+
+	value, err := decodeJSONString([]byte(`"\uD83D\uDE00"`))
+	if err != nil || value != "😀" {
+		t.Errorf("valid pair = (%q, %v), want emoji", value, err)
+	}
+	literal, err := decodeJSONString([]byte(`"\\uD800"`))
+	if err != nil || literal != `\uD800` {
+		t.Errorf("escaped literal = (%q, %v), want literal backslash-u", literal, err)
 	}
 }
 
