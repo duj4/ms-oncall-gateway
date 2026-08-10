@@ -1,8 +1,10 @@
-# Sanitized GoAlert v0.34.1 webhook fixtures
+# Sanitized GoAlert v0.34.1-based webhook fixtures
 
-These JSON files model the payload emitted by MS OnCall Core's GoAlert
+These JSON files model the payload emitted by MS OnCall Core from its GoAlert
 v0.34.1 baseline at commit
-`0918387e38650aaddd6a923d445ee992f64d6ab6`.
+`0918387e38650aaddd6a923d445ee992f64d6ab6`, including the owner-approved
+additive `AlertState` extension for `AlertStatus`. The two status fixtures are
+therefore not pristine upstream v0.34.1 field sets.
 
 ## Fixture set
 
@@ -16,11 +18,13 @@ v0.34.1 baseline at commit
 
 ## Provenance
 
-The exact field sets and casing come from
-`ms-oncall/notification/webhook/sender.go`. Event construction is confirmed
-by `ms-oncall/engine/sendmessage.go`; alert limits and metadata shape come
-from `ms-oncall/alert/alert.go` and `ms-oncall/alert/metadata.go`.
-GoAlert's webhook documentation and smoke test corroborate the payload shape.
+The current field sets and casing come from
+`ms-oncall/notification/webhook/sender.go`. Event construction and the
+`AlertStatus.NewAlertState` mapping are confirmed by
+`ms-oncall/engine/sendmessage.go`; alert limits and metadata shape come from
+`ms-oncall/alert/alert.go` and `ms-oncall/alert/metadata.go`. GoAlert's webhook
+documentation and smoke test corroborate the upstream portion of the payload
+shape.
 
 The PoC evidence in `PROJECT_CONTEXT.md` confirms that the first four
 scenarios traversed the tested Core-to-PrometheusAlert-to-email path. No raw
@@ -28,10 +32,11 @@ PoC request capture was available or read for this task. These are therefore
 source-derived, scenario-matched fixtures rather than byte-for-byte production
 captures.
 
-The two status fixtures intentionally have the same field set. Core v0.34.1
-does not serialize its internal `NewAlertState`; only the rendered
-`LogEntry` distinguishes the scenarios. Consumers must not parse that text
-to infer state.
+The two status fixtures add exactly one field to the pristine upstream field
+set: `AlertState`, with `Acknowledged` or `Closed` according to the scenario.
+The internal `NewAlertState` name and integer enum are not serialized.
+Consumers must use `AlertState`, not parse the display-only `LogEntry`, to
+determine status.
 
 ## Sanitization
 

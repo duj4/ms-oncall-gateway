@@ -2,8 +2,9 @@
 
 Status: Draft contract for the MS OnCall Gateway MVP.
 
-Baseline: GoAlert v0.34.1 at commit
-`0918387e38650aaddd6a923d445ee992f64d6ab6`.
+Upstream baseline: GoAlert v0.34.1 at commit
+`0918387e38650aaddd6a923d445ee992f64d6ab6`. This contract also documents
+owner-approved additive MS OnCall wire extensions to that baseline.
 
 This document defines the Core-to-Gateway intake boundary. It does not define
 provider delivery, provider callbacks, Core alert actions, or the Gateway
@@ -82,7 +83,8 @@ The request body MUST be one UTF-8 JSON object.
 - The Gateway MUST NOT use `AppName`, `AlertID`, `ServiceID`, `Summary`,
   `Meta`, or `LogEntry` as authentication or delivery identity.
 - Delivery identity is carried only in `Idempotency-Key`; it MUST NOT be added
-  to the JSON object. The existing JSON fixtures therefore remain unchanged.
+  to the JSON object. The `AlertState` extension does not change that
+  header-only delivery-identity rule.
 
 Unknown top-level fields are rejected deliberately. A new Core field requires
 an explicit v1 contract update and receiver coverage rather than being silently
@@ -138,23 +140,27 @@ or template code.
 
 ### AlertStatus
 
-Required fields: `AppName`, `Type`, `AlertID`, and `LogEntry`.
+Required fields: `AppName`, `Type`, `AlertID`, `LogEntry`, and `AlertState`.
 
 | Field | Validation |
 | --- | --- |
 | `Type` | Exactly `AlertStatus` |
 | `AlertID` | Positive JSON integer no greater than 9,223,372,036,854,775,807 |
 | `LogEntry` | Non-empty valid Unicode string; the overall request-size limit is the upper bound |
+| `AlertState` | Case-sensitive JSON string exactly equal to `Unacknowledged`, `Acknowledged`, or `Closed` |
 
-Confirmed limitation: the v0.34.1 webhook payload does **not** serialize
-`NewAlertState`, `ServiceID`, `Summary`, or `Details`, even though some
-of those values exist in Core's internal notification object. Acknowledgement
-and closure therefore have the same wire schema and differ only in the
-human-readable `LogEntry` text.
+`AlertState` is an owner-approved additive MS OnCall extension to the pristine
+GoAlert v0.34.1 field set. Current MS OnCall Core derives it directly from the
+internal `NewAlertState`; the internal integer enum and the name
+`NewAlertState` are not serialized. `ServiceID`, `Summary`, and `Details`
+remain absent from this payload.
 
 Gateway MUST treat `LogEntry` as opaque display text. It MUST NOT infer an ACK
-or Closed state by parsing English words. The acknowledged and closed fixture
-names record their source scenario; they do not represent a hidden wire field.
+or Closed state by parsing English words. Acknowledgement and closure business
+logic MUST use `AlertState` only. A missing or `null` `AlertState`, a JSON
+number, incorrect capitalization, or any unknown string does not satisfy this
+contract. `Unacknowledged` preserves the existing escalation status-notification
+behavior.
 
 ## Unsupported and unknown events
 
@@ -356,15 +362,14 @@ the prohibition on no-ID sends are approved and are no longer decision items.
 1. **Core authentication mechanism.** Select mTLS identity, a signed request
    scheme, a narrowly scoped bearer credential, or an approved combination.
    The opaque destination token alone is explicitly insufficient.
-2. **Explicit alert state.** Decide whether Core will add a machine-readable
-   state such as `Acknowledged` or `Closed` to `AlertStatus`. This is
-   recommended; parsing `LogEntry` is prohibited.
-3. **Additional Core event types.** Confirm that `AlertBundle` and
+2. **Additional Core event types.** Confirm that `AlertBundle` and
    `ScheduleOnCallUsers` remain rejected for the Gateway MVP, or approve
    schemas and fixtures for them.
-4. **Opaque token lifecycle.** Define token generation entropy, storage,
+3. **Opaque token lifecycle.** Define token generation entropy, storage,
    rotation, revocation, and overlap behavior. No token format is selected by
    this contract.
 
-Until these decisions are recorded, they remain contract blockers rather than
-implicit implementation defaults.
+The machine-readable `AlertState` field and its three case-sensitive values
+are owner-approved and are no longer a decision item. Until the remaining
+decisions are recorded, they remain contract blockers rather than implicit
+implementation defaults.
