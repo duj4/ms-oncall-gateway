@@ -179,7 +179,50 @@ logs.
 ## Integration-test isolation
 
 PostgreSQL integration tests run only when both a dedicated enable flag and a
-separate test database setting are supplied. They create and remove only a
-randomly named schema inside that explicitly authorized test database. HA/DR
-tests have separate enable and multi-host settings. Ordinary tests never read
-the production database setting and never operate on the Core database.
+separate, explicitly authorized, disposable test database setting are supplied.
+Before a mutation, the harness validates `sslmode=verify-full`,
+`target_session_attrs=read-write`, certificate-file accessibility, private-key
+permissions, the current database identity, a writable primary, TLS, and a
+non-empty client certificate DN. It then uses only the embedded migration runner
+and the Gateway application tables. Durable-acceptance test cleanup is limited
+to `TRUNCATE durable_acceptances`; it does not create or drop a database, schema,
+role, extension, replication object, or server setting.
+
+HA/DR tests have separate enable and multi-host settings. Ordinary tests never
+read the production database setting and never operate on the Core database.
+
+## Durable acceptance persistence checkpoint
+
+The `internal/durable` service and PostgreSQL repository persist records that
+have already been authenticated, resolved, canonicalized, and protected by
+future upstream layers. They are deliberately not wired to the HTTP runtime.
+The running Gateway continues to use `UnavailableSink`, and a persisted
+`durable_acceptances` row is not yet a complete delivery job. Therefore this
+checkpoint does not permit `202 Accepted` or conflict mapping at HTTP intake.
+
+Each top-level store call generates one UUIDv4 receipt candidate in the
+application, acquires one connection from the existing logical read-write pool,
+and opens one read-write, read-committed transaction. The repository executes a
+parameterized insert with `ON CONFLICT ON CONSTRAINT
+durable_acceptances_delivery_identity_unique DO NOTHING RETURNING receipt_id`.
+A returned receipt becomes `AcceptedNew` only after a confirmed commit. A
+conflict performs a separate select in the same transaction and commits before
+the domain service opens the protected digest and compares its literal SHA-256
+value in constant time. Matching format version and digest return the stored
+receipt as `AcceptedDuplicate`; a mismatch returns `IdentityConflict` without a
+receipt or mutation.
+
+There is no transaction retry or replay. A receipt primary-key collision is an
+ordinary store failure. An interrupted insert, unconfirmed rollback, or
+unconfirmed commit is an outcome-unknown failure and destroys the connection
+instead of returning it to the pool. A later top-level request may inspect the
+same durable identity in a new transaction; it must not replay the previous
+transaction. Missing or retired protection keys and protected digests that
+cannot be opened fail closed as an unreadable stored record.
+
+Store errors expose only fixed classifications. Logs and metric labels must not
+contain principals, destinations, delivery identities, receipts, protected
+bytes, literal digests, key IDs, connection settings, certificate paths, or SQL.
+The checkpoint supplies only the digest-opening interface seam and test fakes;
+production encryption, key injection, rotation, retention, update, deletion,
+workers, providers, and HTTP wiring remain unimplemented.

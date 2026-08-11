@@ -2,16 +2,14 @@ package postgres
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
-	"errors"
+	"net/url"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -31,92 +29,47 @@ func TestPostgresMigrationIntegration(t *testing.T) {
 		t.Fatal("专用 PostgreSQL 测试已启用，但测试数据库配置缺失")
 	}
 
-	t.Run("first initialization and repeated no-op", func(t *testing.T) {
-		withTestSchema(t, databaseURL, func(ctx context.Context, pool *pgxpool.Pool) {
-			runner := NewRunner(NewPGBackend(pool), EmbeddedMigrations(), nil)
-			if err := runner.Run(ctx); err != nil {
-				t.Fatalf("first migration run: %v", err)
-			}
-			var firstApplied time.Time
-			if err := pool.QueryRow(ctx, "select applied_at from gateway_schema_migrations where migration_version = 1").Scan(&firstApplied); err != nil {
-				t.Fatal("read first migration metadata")
-			}
-			if err := runner.Run(ctx); err != nil {
-				t.Fatalf("repeated migration run: %v", err)
-			}
-			var secondApplied time.Time
-			if err := pool.QueryRow(ctx, "select applied_at from gateway_schema_migrations where migration_version = 1").Scan(&secondApplied); err != nil {
-				t.Fatal("read repeated migration metadata")
-			}
-			if !firstApplied.Equal(secondApplied) {
-				t.Error("current schema was unexpectedly rewritten")
-			}
-		})
-	})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := openIntegrationPool(t, ctx, databaseURL)
+	defer pool.Close()
+	verifyIntegrationSession(t, ctx, pool, databaseURL)
 
-	t.Run("legal forward upgrade", func(t *testing.T) {
-		withTestSchema(t, databaseURL, func(ctx context.Context, pool *pgxpool.Pool) {
-			first := EmbeddedMigrations()
-			if err := NewRunner(NewPGBackend(pool), first, nil).Run(ctx); err != nil {
-				t.Fatalf("initial migration: %v", err)
-			}
-			second := testMigration(2, "000002_integration_upgrade.sql", "alter table durable_acceptances add column integration_marker text")
-			if err := NewRunner(NewPGBackend(pool), append(first, second), nil).Run(ctx); err != nil {
-				t.Fatalf("forward migration: %v", err)
-			}
-			var version int64
-			if err := pool.QueryRow(ctx, "select max(migration_version) from gateway_schema_migrations").Scan(&version); err != nil || version != 2 {
-				t.Errorf("schema version = %d, error = %v", version, err)
-			}
-		})
-	})
+	runner := NewRunner(NewPGBackend(pool), EmbeddedMigrations(), nil)
+	if err := runner.Run(ctx); err != nil {
+		t.Fatalf("首次 schema preparation 失败: %v", err)
+	}
+	var firstApplied time.Time
+	if err := pool.QueryRow(ctx, "select applied_at from gateway_schema_migrations where migration_version = 1").Scan(&firstApplied); err != nil {
+		t.Fatal("读取 migration metadata 失败")
+	}
+	if err := runner.Run(ctx); err != nil {
+		t.Fatalf("重复 schema preparation 失败: %v", err)
+	}
+	var secondApplied time.Time
+	if err := pool.QueryRow(ctx, "select applied_at from gateway_schema_migrations where migration_version = 1").Scan(&secondApplied); err != nil {
+		t.Fatal("读取重复 migration metadata 失败")
+	}
+	if !firstApplied.Equal(secondApplied) {
+		t.Fatal("current schema 被意外重写")
+	}
 
-	t.Run("concurrent runners serialize", func(t *testing.T) {
-		withTestSchema(t, databaseURL, func(ctx context.Context, pool *pgxpool.Pool) {
-			var wait sync.WaitGroup
-			errorsFound := make(chan error, 2)
-			wait.Add(2)
-			for range 2 {
-				go func() {
-					defer wait.Done()
-					errorsFound <- NewRunner(NewPGBackend(pool), EmbeddedMigrations(), nil).Run(ctx)
-				}()
-			}
-			wait.Wait()
-			close(errorsFound)
-			for err := range errorsFound {
-				if err != nil {
-					t.Errorf("concurrent runner: %v", err)
-				}
-			}
-			var count int
-			if err := pool.QueryRow(ctx, "select count(*) from gateway_schema_migrations").Scan(&count); err != nil || count != 1 {
-				t.Errorf("migration record count = %d, error = %v", count, err)
-			}
-		})
-	})
-
-	t.Run("failed migration rolls back", func(t *testing.T) {
-		withTestSchema(t, databaseURL, func(ctx context.Context, pool *pgxpool.Pool) {
-			first := EmbeddedMigrations()
-			if err := NewRunner(NewPGBackend(pool), first, nil).Run(ctx); err != nil {
-				t.Fatalf("initial migration: %v", err)
-			}
-			failed := testMigration(2, "000002_integration_failure.sql", "create table rollback_probe (id bigint); select 1 / 0")
-			err := NewRunner(NewPGBackend(pool), append(first, failed), nil).Run(ctx)
-			if !errors.Is(err, ErrMigration) {
-				t.Fatalf("failure = %v, want ErrMigration", err)
-			}
-			var version int64
-			if err := pool.QueryRow(ctx, "select max(migration_version) from gateway_schema_migrations").Scan(&version); err != nil || version != 1 {
-				t.Errorf("schema version after failure = %d, error = %v", version, err)
-			}
-			var probeExists bool
-			if err := pool.QueryRow(ctx, "select to_regclass('rollback_probe') is not null").Scan(&probeExists); err != nil || probeExists {
-				t.Errorf("rollback probe exists = %t, error = %v", probeExists, err)
-			}
-		})
-	})
+	var wait sync.WaitGroup
+	errorsFound := make(chan error, 2)
+	wait.Add(2)
+	for range 2 {
+		go func() {
+			defer wait.Done()
+			errorsFound <- NewRunner(NewPGBackend(pool), EmbeddedMigrations(), nil).Run(ctx)
+		}()
+	}
+	wait.Wait()
+	close(errorsFound)
+	for err := range errorsFound {
+		if err != nil {
+			t.Errorf("并发 current-schema inspection 失败: %v", err)
+		}
+	}
 }
 
 func TestPostgresMultiInstanceHAIntegration(t *testing.T) {
@@ -134,66 +87,91 @@ func TestPostgresMultiInstanceHAIntegration(t *testing.T) {
 	if len(config.ConnConfig.Fallbacks) == 0 {
 		t.Fatal("HA/DR 测试配置必须包含多个 instance")
 	}
-	withTestSchema(t, databaseURL, func(ctx context.Context, pool *pgxpool.Pool) {
-		if err := NewRunner(NewPGBackend(pool), EmbeddedMigrations(), nil).Run(ctx); err != nil {
-			t.Fatalf("HA/DR logical pool migration: %v", err)
-		}
-	})
-}
 
-func withTestSchema(t *testing.T, databaseURL string, run func(context.Context, *pgxpool.Pool)) {
-	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	baseConfig, err := ParsePoolConfig(databaseURL)
+	pool := openIntegrationPool(t, ctx, databaseURL)
+	defer pool.Close()
+	verifyIntegrationSession(t, ctx, pool, databaseURL)
+	if err := NewRunner(NewPGBackend(pool), EmbeddedMigrations(), nil).Run(ctx); err != nil {
+		t.Fatalf("HA/DR logical pool migration: %v", err)
+	}
+}
+
+func openIntegrationPool(t *testing.T, ctx context.Context, databaseURL string) *pgxpool.Pool {
+	t.Helper()
+	validateIntegrationTarget(t, databaseURL)
+	config, err := ParsePoolConfig(databaseURL)
 	if err != nil {
 		t.Fatalf("解析专用测试数据库配置失败: %v", err)
 	}
-	basePool, err := pgxpool.NewWithConfig(ctx, baseConfig)
+	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		t.Fatal("连接专用测试数据库失败")
 	}
-	if err := basePool.Ping(ctx); err != nil {
-		basePool.Close()
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
 		t.Fatal("专用测试数据库不可用")
 	}
-
-	schema := randomTestSchema(t)
-	identifier := pgx.Identifier{schema}.Sanitize()
-	if _, err := basePool.Exec(ctx, "create schema "+identifier); err != nil {
-		basePool.Close()
-		t.Fatal("创建隔离测试 schema 失败")
-	}
-	defer func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cleanupCancel()
-		_, _ = basePool.Exec(cleanupCtx, "drop schema "+identifier+" cascade")
-		basePool.Close()
-	}()
-
-	testConfig := baseConfig.Copy()
-	testConfig.ConnConfig.RuntimeParams["search_path"] = schema
-	testPool, err := pgxpool.NewWithConfig(ctx, testConfig)
-	if err != nil {
-		t.Fatal("创建隔离测试连接池失败")
-	}
-	defer testPool.Close()
-	if err := testPool.Ping(ctx); err != nil {
-		t.Fatal("隔离测试 schema 不可用")
-	}
-	run(ctx, testPool)
+	return pool
 }
 
-func randomTestSchema(t *testing.T) string {
+func validateIntegrationTarget(t *testing.T, databaseURL string) {
 	t.Helper()
-	random := make([]byte, 8)
-	if _, err := rand.Read(random); err != nil {
-		t.Fatal("生成测试 schema 标识失败")
+	parsed, err := url.Parse(databaseURL)
+	if err != nil || parsed.Scheme != "postgresql" || parsed.Host == "" || parsed.User == nil || parsed.User.Username() == "" {
+		t.Fatal("专用 PostgreSQL 测试 URL 不满足安全策略")
 	}
-	return "gateway_migration_test_" + hex.EncodeToString(random)
+	if strings.TrimPrefix(parsed.Path, "/") == "" {
+		t.Fatal("专用 PostgreSQL 测试 database 缺失")
+	}
+	query := parsed.Query()
+	if query.Get("sslmode") != requiredSSLMode || query.Get("target_session_attrs") != requiredTargetSessionAttrs {
+		t.Fatal("专用 PostgreSQL 测试必须使用 verify-full 和 read-write target")
+	}
+	for _, parameter := range []string{"sslrootcert", "sslcert", "sslkey"} {
+		values, ok := query[parameter]
+		if !ok || len(values) != 1 || !filepath.IsAbs(values[0]) {
+			t.Fatal("专用 PostgreSQL 测试证书路径配置无效")
+		}
+		if _, err := os.Stat(values[0]); err != nil {
+			t.Fatal("专用 PostgreSQL 测试证书文件不可读")
+		}
+	}
+	keyInfo, err := os.Stat(query.Get("sslkey"))
+	if err != nil || keyInfo.Mode().Perm()&0o077 != 0 {
+		t.Fatal("专用 PostgreSQL 测试私钥权限不安全")
+	}
 }
 
-func testMigration(version int64, name, sql string) Migration {
-	digest := sha256.Sum256([]byte(sql))
-	return Migration{Version: version, Name: name, SQL: sql, Checksum: hex.EncodeToString(digest[:])}
+func verifyIntegrationSession(t *testing.T, ctx context.Context, pool *pgxpool.Pool, databaseURL string) {
+	t.Helper()
+	parsed, err := url.Parse(databaseURL)
+	if err != nil {
+		t.Fatal("专用 PostgreSQL 测试 URL 无法复核")
+	}
+	expectedDatabase := strings.TrimPrefix(parsed.Path, "/")
+	expectedUser := parsed.User.Username()
+	var (
+		currentUser     string
+		currentDatabase string
+		inRecovery      bool
+		secureSession   bool
+	)
+	if err := pool.QueryRow(ctx, `
+		select
+			current_user,
+			current_database(),
+			pg_is_in_recovery(),
+			coalesce((
+				select ssl and client_dn is not null
+				from pg_stat_ssl
+				where pid = pg_backend_pid()
+			), false)
+	`).Scan(&currentUser, &currentDatabase, &inRecovery, &secureSession); err != nil {
+		t.Fatal("专用 PostgreSQL session 安全检查失败")
+	}
+	if currentUser != expectedUser || currentDatabase != expectedDatabase || inRecovery || !secureSession {
+		t.Fatal("专用 PostgreSQL session 不满足 user/database/read-write/mTLS 策略")
+	}
 }
