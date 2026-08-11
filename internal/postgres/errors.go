@@ -53,6 +53,10 @@ func migrationFailure(err error, operation string) error {
 }
 
 func isMigrationInterruption(err error) bool {
+	return isConnectionInterruption(err)
+}
+
+func isConnectionInterruption(err error) bool {
 	if err == nil {
 		return false
 	}
