@@ -96,17 +96,19 @@ func TestDurableAcceptancePostgresIntegration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	pool := openIntegrationPool(t, ctx, databaseURL)
-	defer pool.Close()
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		defer pool.Close()
+		if _, err := pool.Exec(cleanupCtx, "truncate table durable_acceptances"); err != nil {
+			t.Error("final durable_acceptances cleanup failed")
+		}
+	})
 	verifyIntegrationSession(t, ctx, pool, databaseURL)
 	if err := NewRunner(NewPGBackend(pool), EmbeddedMigrations(), nil).Run(ctx); err != nil {
 		t.Fatalf("schema preparation 失败: %v", err)
 	}
 	truncateDurableAcceptances(t, ctx, pool)
-	t.Cleanup(func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cleanupCancel()
-		_, _ = pool.Exec(cleanupCtx, "truncate table durable_acceptances")
-	})
 
 	newStore := func(target Pool) durable.Store {
 		return durable.NewService(NewAcceptanceRepository(target), integrationDigestOpener{})
