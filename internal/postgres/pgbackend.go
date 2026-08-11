@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -12,6 +13,7 @@ import (
 const (
 	migrationAdvisoryLockKey int64 = 0x4d534f4e43414c4c // ASCII "MSONCALL"
 	lockCleanupTimeout             = 5 * time.Second
+	migrationRollbackTimeout       = 5 * time.Second
 )
 
 type PGBackend struct {
@@ -34,18 +36,43 @@ func (b *PGBackend) WithMigrationLock(ctx context.Context, run func(MigrationSes
 	}
 
 	runErr := run(&pgSession{connection: connection})
+	return finishMigrationConnection(
+		runErr,
+		func(cleanupCtx context.Context) (bool, error) {
+			var unlocked bool
+			err := connection.QueryRow(cleanupCtx, "select pg_advisory_unlock($1)", migrationAdvisoryLockKey).Scan(&unlocked)
+			return unlocked, err
+		},
+		connection.Release,
+		func() { destroyPoolConnection(connection) },
+	)
+}
+
+func finishMigrationConnection(
+	runErr error,
+	unlock func(context.Context) (bool, error),
+	release func(),
+	destroy func(),
+) error {
+	// An interrupted migration, including an unconfirmed rollback, makes the
+	// connection unsafe to reuse. Hijacking it also guarantees that a
+	// session-level advisory lock cannot return to the pool.
+	if errors.Is(runErr, ErrMigrationInterrupted) {
+		destroy()
+		return runErr
+	}
+
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), lockCleanupTimeout)
 	defer cancel()
-	var unlocked bool
-	unlockErr := connection.QueryRow(cleanupCtx, "select pg_advisory_unlock($1)", migrationAdvisoryLockKey).Scan(&unlocked)
+	unlocked, unlockErr := unlock(cleanupCtx)
 	if unlockErr != nil || !unlocked {
-		destroyPoolConnection(connection)
+		destroy()
 		if runErr != nil {
 			return runErr
 		}
 		return safeError(ErrMigrationLock, "lock release")
 	}
-	connection.Release()
+	release()
 	return runErr
 }
 
@@ -81,25 +108,60 @@ func applyMigration(
 	migration Migration,
 	begin func(context.Context) (migrationTransaction, error),
 ) error {
+	return applyMigrationWithRollbackTimeout(ctx, migration, migrationRollbackTimeout, begin)
+}
+
+func applyMigrationWithRollbackTimeout(
+	ctx context.Context,
+	migration Migration,
+	rollbackTimeout time.Duration,
+	begin func(context.Context) (migrationTransaction, error),
+) (resultErr error) {
 	transaction, err := begin(ctx)
 	if err != nil {
-		return safeError(ErrMigration, "transaction begin")
+		return migrationFailure(err, "transaction begin")
 	}
-	defer func() { _ = transaction.Rollback(context.Background()) }()
+	transactionOpen := true
+	defer func() {
+		if !transactionOpen {
+			return
+		}
+		rollbackCtx, cancel := boundedCleanupContext(ctx, rollbackTimeout)
+		rollbackErr := transaction.Rollback(rollbackCtx)
+		cancel()
+		if rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
+			// The transaction state cannot be confirmed. Replace the original
+			// failure with a safe interruption classification so the owning
+			// migration connection is destroyed rather than pooled.
+			resultErr = safeError(ErrMigrationInterrupted, "transaction cleanup")
+		}
+	}()
 
 	if _, err := transaction.Exec(ctx, migration.SQL, pgx.QueryExecModeSimpleProtocol); err != nil {
-		return safeError(ErrMigration, "migration execution")
+		return migrationFailure(err, "migration execution")
 	}
 	if _, err := transaction.Exec(ctx, `
 		insert into gateway_schema_migrations (migration_version, migration_checksum)
 		values ($1, $2)
 	`, migration.Version, migration.Checksum); err != nil {
-		return safeError(ErrMigration, "migration record")
+		return migrationFailure(err, "migration record")
 	}
 	if err := transaction.Commit(ctx); err != nil {
-		return safeError(ErrMigration, "transaction commit")
+		return migrationFailure(err, "transaction commit")
 	}
+	transactionOpen = false
 	return nil
+}
+
+func boundedCleanupContext(parent context.Context, limit time.Duration) (context.Context, context.CancelFunc) {
+	deadline := time.Now().Add(limit)
+	if parentDeadline, ok := parent.Deadline(); ok && parentDeadline.Before(deadline) {
+		deadline = parentDeadline
+	}
+	// Preserve values but deliberately detach cancellation: cleanup remains
+	// possible after an early cancel while retaining the earlier of the parent
+	// deadline and the finite local cap.
+	return context.WithDeadline(context.WithoutCancel(parent), deadline)
 }
 
 type pgQueryer interface {

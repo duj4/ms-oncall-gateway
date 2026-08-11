@@ -32,6 +32,7 @@ type fakeMigrationSession struct {
 	applied     []AppliedMigration
 	applyCalls  []int64
 	failVersion int64
+	failErr     error
 	inspectErr  error
 	inspectCall int
 }
@@ -51,6 +52,9 @@ func (s *fakeMigrationSession) Inspect(_ context.Context, migrations []Migration
 func (s *fakeMigrationSession) Apply(_ context.Context, migration Migration) error {
 	s.applyCalls = append(s.applyCalls, migration.Version)
 	if migration.Version == s.failVersion {
+		if s.failErr != nil {
+			return s.failErr
+		}
 		return safeError(ErrMigration, "migration execution")
 	}
 	s.initialized = true
@@ -197,5 +201,23 @@ func TestRunnerAfterConnectionInterruptionReacquiresLockAndReinspects(t *testing
 	}
 	if len(reselectedSession.applyCalls) != 1 || reselectedSession.applyCalls[0] != 1 {
 		t.Errorf("restarted apply calls = %v, want [1]", reselectedSession.applyCalls)
+	}
+}
+
+func TestRunnerStopsAfterMigrationInterruptionWithoutReplay(t *testing.T) {
+	migrations := testMigrations(2)
+	session := &fakeMigrationSession{
+		failVersion: 1,
+		failErr:     safeError(ErrMigrationInterrupted, "transaction commit"),
+	}
+	err := NewRunner(&fakeMigrationLocker{session: session}, migrations, nil).Run(context.Background())
+	if !errors.Is(err, ErrMigrationInterrupted) || !errors.Is(err, ErrMigration) {
+		t.Fatalf("error = %v, want interrupted migration", err)
+	}
+	if len(session.applyCalls) != 1 || session.applyCalls[0] != 1 {
+		t.Errorf("apply calls = %v, want one attempt for version 1", session.applyCalls)
+	}
+	if session.inspectCall != 1 {
+		t.Errorf("inspect calls = %d, want no post-interruption replay or verification", session.inspectCall)
 	}
 }

@@ -39,6 +39,7 @@ func TestRunFailsClosedBeforeListener(t *testing.T) {
 		{name: "database connection failure", databaseURL: "configured", prepareErr: &postgres.SafeError{Kind: postgres.ErrConnect, Operation: "connection"}},
 		{name: "schema ahead", databaseURL: "configured", prepareErr: &postgres.SafeError{Kind: postgres.ErrSchemaAhead, Operation: "schema compatibility"}},
 		{name: "schema invalid", databaseURL: "configured", prepareErr: &postgres.SafeError{Kind: postgres.ErrSchemaInvalid, Operation: "schema compatibility"}},
+		{name: "migration interrupted", databaseURL: "configured", prepareErr: &postgres.SafeError{Kind: postgres.ErrMigrationInterrupted, Operation: "transaction cleanup"}},
 		{name: "migration failure", databaseURL: "configured", prepareErr: &postgres.SafeError{Kind: postgres.ErrMigration, Operation: "migration execution"}},
 	}
 
@@ -126,6 +127,7 @@ func TestFailureReasonIsBoundedAndRedacted(t *testing.T) {
 		{err: &postgres.SafeError{Kind: postgres.ErrSchemaAhead, Operation: "schema"}, want: "database_schema_ahead"},
 		{err: &postgres.SafeError{Kind: postgres.ErrSchemaInvalid, Operation: "schema"}, want: "database_schema_invalid"},
 		{err: &postgres.SafeError{Kind: postgres.ErrSchemaQuery, Operation: "schema"}, want: "database_schema_query_failed"},
+		{err: &postgres.SafeError{Kind: postgres.ErrMigrationInterrupted, Operation: "private host and credential details"}, want: "database_migration_interrupted"},
 		{err: &postgres.SafeError{Kind: postgres.ErrMigration, Operation: "migration"}, want: "database_migration_failed"},
 		{err: errors.New("private host and credential details"), want: "runtime_failed"},
 	}

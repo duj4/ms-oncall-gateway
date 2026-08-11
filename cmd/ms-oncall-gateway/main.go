@@ -100,6 +100,8 @@ func failureReason(err error) string {
 		return "database_schema_invalid"
 	case errors.Is(err, postgres.ErrSchemaQuery):
 		return "database_schema_query_failed"
+	case errors.Is(err, postgres.ErrMigrationInterrupted):
+		return "database_migration_interrupted"
 	case errors.Is(err, postgres.ErrMigration):
 		return "database_migration_failed"
 	default:

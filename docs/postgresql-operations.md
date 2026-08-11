@@ -111,9 +111,20 @@ Non-sensitive log events distinguish:
 - `database_migration_starting` and `database_migration_applied` with numeric
   application schema version;
 - `database_schema_current`;
+- `gateway_failed` with reason `database_migration_interrupted` when a bounded
+  transaction cleanup, connection loss, cancellation, deadline, or commit
+  outcome cannot be confirmed;
 - `gateway_failed` with a bounded reason code.
 
 No SQL body or connection value is included in these events.
+
+Rollback cleanup uses the earlier of the startup/migration deadline and a
+finite local timeout. A failed or unconfirmed rollback marks the migration
+connection unsafe: it is removed from the pool, closed with a bounded context,
+and the startup fails with `database_migration_interrupted`. Gateway does not
+retry or replay that migration transaction. Ordinary PostgreSQL SQL, DDL,
+permission, and constraint errors remain the separate bounded migration-failed
+category.
 
 ## HA, failover and cross-DC DR boundary
 
