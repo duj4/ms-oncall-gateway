@@ -15,10 +15,10 @@ func (function repositoryFunc) InsertOrLoad(ctx context.Context, candidate Candi
 	return function(ctx, candidate)
 }
 
-type openerFunc func(context.Context, ProtectedValue, string) (CanonicalDigest, error)
+type openerFunc func(context.Context, DigestOpenRequest) (CanonicalDigest, error)
 
-func (function openerFunc) OpenDigest(ctx context.Context, protected ProtectedValue, keyID string) (CanonicalDigest, error) {
-	return function(ctx, protected, keyID)
+func (function openerFunc) OpenDigest(ctx context.Context, request DigestOpenRequest) (CanonicalDigest, error) {
+	return function(ctx, request)
 }
 
 type generatorFunc func() (ReceiptID, error)
@@ -55,7 +55,7 @@ func testProtected(t *testing.T, value string) ProtectedValue {
 	t.Helper()
 	protected, err := NewProtectedValue([]byte("ciphertext-"+value), []byte("nonce-"+value))
 	if err != nil {
-		t.Fatalf("NewProtectedValue: %v", err)
+		t.Fatal("protected value test setup failed")
 	}
 	return protected
 }
@@ -73,7 +73,7 @@ func testAcceptance(t *testing.T, version int64, digest CanonicalDigest) Prepare
 		digest,
 	)
 	if err != nil {
-		t.Fatalf("NewPreparedAcceptance: %v", err)
+		t.Fatal("prepared acceptance test setup failed")
 	}
 	return acceptance
 }
@@ -82,16 +82,16 @@ func TestUUIDv4GeneratorVersionVariantAndFailure(t *testing.T) {
 	input := bytes.Repeat([]byte{0xff}, 16)
 	receipt, err := (UUIDv4Generator{Reader: bytes.NewReader(input)}).NewReceiptID()
 	if err != nil {
-		t.Fatalf("NewReceiptID: %v", err)
+		t.Fatal("receipt generation failed")
 	}
 	if version := receipt[6] >> 4; version != 4 {
-		t.Errorf("UUID version = %d, want 4", version)
+		t.Error("UUID version mismatch")
 	}
 	if variant := receipt[8] >> 6; variant != 2 {
-		t.Errorf("UUID variant bits = %02b, want 10", variant)
+		t.Error("UUID variant mismatch")
 	}
 	if _, err := (UUIDv4Generator{Reader: io.LimitReader(bytes.NewReader(input), 15)}).NewReceiptID(); !errors.Is(err, ErrReceiptGeneration) {
-		t.Fatalf("short random source error = %v, want ErrReceiptGeneration", err)
+		t.Fatal("short receipt random source was not rejected")
 	}
 }
 
@@ -100,7 +100,7 @@ func TestPreparedAcceptanceValidationAndDefensiveCopies(t *testing.T) {
 	nonce := []byte("event-nonce")
 	event, err := NewProtectedValue(ciphertext, nonce)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("event protection test setup failed")
 	}
 	digest := testDigest(3)
 	acceptance, err := NewPreparedAcceptance(
@@ -114,7 +114,7 @@ func TestPreparedAcceptanceValidationAndDefensiveCopies(t *testing.T) {
 		digest,
 	)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("prepared acceptance construction failed")
 	}
 	ciphertext[0] = 'X'
 	nonce[0] = 'X'
@@ -152,15 +152,15 @@ func TestPreparedAcceptanceValidationAndDefensiveCopies(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			_, err := NewPreparedAcceptance(test.principal, test.destination, test.identity, test.version, test.event, test.digest, test.keyID, CanonicalDigest{})
 			if !errors.Is(err, ErrInvalidAcceptance) {
-				t.Fatalf("validation error = %v, want ErrInvalidAcceptance", err)
+				t.Fatal("invalid acceptance was not rejected")
 			}
 		})
 	}
 	if _, err := NewProtectedValue(nil, []byte("nonce")); !errors.Is(err, ErrInvalidAcceptance) {
-		t.Errorf("empty ciphertext error = %v", err)
+		t.Error("empty ciphertext was not rejected")
 	}
 	if _, err := NewProtectedValue([]byte("ciphertext"), nil); !errors.Is(err, ErrInvalidAcceptance) {
-		t.Errorf("empty nonce error = %v", err)
+		t.Error("empty nonce was not rejected")
 	}
 }
 
@@ -172,11 +172,11 @@ func TestServiceNewGeneratesExactlyOneCandidateReceipt(t *testing.T) {
 		repositoryFunc(func(_ context.Context, candidate Candidate) (PersistenceResult, error) {
 			repositoryCalls++
 			if candidate.ReceiptID != receipt {
-				t.Errorf("candidate receipt = %v, want generated receipt", candidate.ReceiptID)
+				t.Error("candidate receipt mismatch")
 			}
 			return PersistenceResult{Inserted: true, Stored: StoredAcceptance{ReceiptID: receipt}}, nil
 		}),
-		openerFunc(func(context.Context, ProtectedValue, string) (CanonicalDigest, error) {
+		openerFunc(func(context.Context, DigestOpenRequest) (CanonicalDigest, error) {
 			t.Fatal("opener called for new acceptance")
 			return CanonicalDigest{}, nil
 		}),
@@ -187,10 +187,10 @@ func TestServiceNewGeneratesExactlyOneCandidateReceipt(t *testing.T) {
 	)
 	result, err := service.Accept(context.Background(), testAcceptance(t, 1, testDigest(1)))
 	if err != nil {
-		t.Fatalf("Accept: %v", err)
+		t.Fatal("new acceptance failed")
 	}
 	if result.Disposition != AcceptedNew || result.ReceiptID != receipt {
-		t.Errorf("result = %+v, want AcceptedNew with generated receipt", result)
+		t.Error("new acceptance result mismatch")
 	}
 	if generated != 1 || repositoryCalls != 1 {
 		t.Errorf("generator/repository calls = %d/%d, want 1/1", generated, repositoryCalls)
@@ -202,6 +202,7 @@ func TestServiceDuplicateConflictAndUnreadableRecord(t *testing.T) {
 	acceptance := testAcceptance(t, 2, requestDigest)
 	existingReceipt := testReceipt(20)
 	storedProtected := testProtected(t, "stored-digest")
+	const storedKeyID = "different-key-and-protected-bytes-are-allowed"
 
 	tests := []struct {
 		name          string
@@ -225,12 +226,18 @@ func TestServiceDuplicateConflictAndUnreadableRecord(t *testing.T) {
 						ReceiptID:       existingReceipt,
 						FormatVersion:   test.storedVersion,
 						ProtectedDigest: storedProtected,
-						EncryptionKeyID: "different-key-and-protected-bytes-are-allowed",
+						EncryptionKeyID: storedKeyID,
 					}}, nil
 				}),
-				openerFunc(func(_ context.Context, protected ProtectedValue, keyID string) (CanonicalDigest, error) {
-					if string(protected.Ciphertext()) != string(storedProtected.Ciphertext()) || keyID == "" {
-						t.Fatal("opener did not receive the stored protected digest and key ID")
+				openerFunc(func(_ context.Context, request DigestOpenRequest) (CanonicalDigest, error) {
+					if string(request.ProtectedDigest.Ciphertext()) != string(storedProtected.Ciphertext()) ||
+						string(request.ProtectedDigest.Nonce()) != string(storedProtected.Nonce()) ||
+						request.EncryptionKeyID != storedKeyID ||
+						request.CorePrincipalID != acceptance.CorePrincipalID() ||
+						request.DestinationID != acceptance.DestinationID() ||
+						request.DeliveryIdentity != acceptance.DeliveryIdentity() ||
+						request.FormatVersion != test.storedVersion {
+						t.Fatal("opener request context mismatch")
 					}
 					return test.openedDigest, test.openErr
 				}),
@@ -238,13 +245,13 @@ func TestServiceDuplicateConflictAndUnreadableRecord(t *testing.T) {
 			)
 			result, err := service.Accept(context.Background(), acceptance)
 			if !errors.Is(err, test.wantErr) {
-				t.Fatalf("error = %v, want %v", err, test.wantErr)
+				t.Fatal("durable disposition error mismatch")
 			}
 			if test.wantErr != nil && (err == nil || strings.Contains(err.Error(), "sensitive")) {
-				t.Fatalf("unsafe opener error = %v", err)
+				t.Fatal("unsafe opener error was not redacted")
 			}
 			if result.Disposition != test.want || result.ReceiptID != test.wantReceipt {
-				t.Errorf("result = %+v, want disposition %d receipt %v", result, test.want, test.wantReceipt)
+				t.Error("durable disposition result mismatch")
 			}
 			if test.want == IdentityConflict && !result.ReceiptID.IsZero() {
 				t.Error("identity conflict returned a receipt")
@@ -272,12 +279,12 @@ func TestServiceFailsClosedAndRedactsRepositoryAndGeneratorErrors(t *testing.T) 
 				repositoryFunc(func(context.Context, Candidate) (PersistenceResult, error) {
 					return PersistenceResult{}, test.repoErr
 				}),
-				openerFunc(func(context.Context, ProtectedValue, string) (CanonicalDigest, error) { return CanonicalDigest{}, nil }),
+				openerFunc(func(context.Context, DigestOpenRequest) (CanonicalDigest, error) { return CanonicalDigest{}, nil }),
 				generatorFunc(func() (ReceiptID, error) { return testReceipt(1), nil }),
 			)
 			_, err := service.Accept(context.Background(), acceptance)
 			if !errors.Is(err, test.want) || strings.Contains(err.Error(), privateText) {
-				t.Fatalf("error = %v, want safe %v", err, test.want)
+				t.Fatal("repository error classification was unsafe")
 			}
 		})
 	}
@@ -287,11 +294,11 @@ func TestServiceFailsClosedAndRedactsRepositoryAndGeneratorErrors(t *testing.T) 
 			t.Fatal("repository called after receipt generation failure")
 			return PersistenceResult{}, nil
 		}),
-		openerFunc(func(context.Context, ProtectedValue, string) (CanonicalDigest, error) { return CanonicalDigest{}, nil }),
+		openerFunc(func(context.Context, DigestOpenRequest) (CanonicalDigest, error) { return CanonicalDigest{}, nil }),
 		generatorFunc(func() (ReceiptID, error) { return ReceiptID{}, errors.New(privateText) }),
 	)
 	if _, err := service.Accept(context.Background(), acceptance); !errors.Is(err, ErrReceiptGeneration) || strings.Contains(err.Error(), privateText) {
-		t.Fatalf("receipt error = %v", err)
+		t.Fatal("receipt error classification was unsafe")
 	}
 }
 
@@ -313,7 +320,7 @@ func TestServiceDoesNotReplayUnknownOutcomeAndLaterCallMayInspect(t *testing.T) 
 				EncryptionKeyID: "key-after-unknown",
 			}}, nil
 		}),
-		openerFunc(func(context.Context, ProtectedValue, string) (CanonicalDigest, error) {
+		openerFunc(func(context.Context, DigestOpenRequest) (CanonicalDigest, error) {
 			return testDigest(4), nil
 		}),
 		generatorFunc(func() (ReceiptID, error) {
@@ -323,14 +330,14 @@ func TestServiceDoesNotReplayUnknownOutcomeAndLaterCallMayInspect(t *testing.T) 
 	)
 
 	if _, err := service.Accept(context.Background(), acceptance); !errors.Is(err, ErrStoreOutcomeUnknown) {
-		t.Fatalf("first error = %v, want ErrStoreOutcomeUnknown", err)
+		t.Fatal("unknown outcome classification mismatch")
 	}
 	if repositoryCalls != 1 || generatorCalls != 1 {
 		t.Fatalf("unknown outcome was replayed: repository/generator calls = %d/%d", repositoryCalls, generatorCalls)
 	}
 	result, err := service.Accept(context.Background(), acceptance)
 	if err != nil || result.Disposition != AcceptedDuplicate || result.ReceiptID != existingReceipt {
-		t.Fatalf("later inspection result/error = %+v/%v", result, err)
+		t.Fatal("later duplicate inspection failed")
 	}
 	if repositoryCalls != 2 || generatorCalls != 2 {
 		t.Fatalf("top-level calls did not each use one attempt/candidate: %d/%d", repositoryCalls, generatorCalls)

@@ -46,8 +46,17 @@ type Repository interface {
 	InsertOrLoad(context.Context, Candidate) (PersistenceResult, error)
 }
 
+type DigestOpenRequest struct {
+	ProtectedDigest  ProtectedValue
+	EncryptionKeyID  string
+	CorePrincipalID  string
+	DestinationID    string
+	DeliveryIdentity DeliveryIdentity
+	FormatVersion    int64
+}
+
 type DigestOpener interface {
-	OpenDigest(context.Context, ProtectedValue, string) (CanonicalDigest, error)
+	OpenDigest(context.Context, DigestOpenRequest) (CanonicalDigest, error)
 }
 
 type ReceiptGenerator interface {
@@ -116,7 +125,14 @@ func (service *Service) Accept(ctx context.Context, acceptance PreparedAcceptanc
 	if stored.ReceiptID.IsZero() || stored.FormatVersion <= 0 || !stored.ProtectedDigest.valid() || stored.EncryptionKeyID == "" {
 		return Result{}, ErrStoredRecordUnreadable
 	}
-	storedDigest, err := service.opener.OpenDigest(ctx, cloneProtectedValue(stored.ProtectedDigest), stored.EncryptionKeyID)
+	storedDigest, err := service.opener.OpenDigest(ctx, DigestOpenRequest{
+		ProtectedDigest:  cloneProtectedValue(stored.ProtectedDigest),
+		EncryptionKeyID:  stored.EncryptionKeyID,
+		CorePrincipalID:  acceptance.corePrincipalID,
+		DestinationID:    acceptance.destinationID,
+		DeliveryIdentity: acceptance.deliveryIdentity,
+		FormatVersion:    stored.FormatVersion,
+	})
 	if err != nil {
 		return Result{}, ErrStoredRecordUnreadable
 	}
