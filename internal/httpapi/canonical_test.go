@@ -69,17 +69,17 @@ func TestCanonicalEventGoldenVectors(t *testing.T) {
 			for iteration := 0; iteration < 3; iteration++ {
 				canonical, err := CanonicalizeEvent(test.event)
 				if err != nil {
-					t.Fatalf("canonicalize event: %v", err)
+					t.Fatal("canonicalization failed")
 				}
 				if canonical.FormatVersion() != CanonicalEventFormatVersion {
-					t.Errorf("format version = %d, want %d", canonical.FormatVersion(), CanonicalEventFormatVersion)
+					t.Error("canonical format version differs from Canonical Event Format V1")
 				}
 				if got := string(canonical.Bytes()); got != test.bytes {
-					t.Errorf("canonical bytes = %q, want %q", got, test.bytes)
+					t.Error("canonical bytes differ from golden vector")
 				}
 				digest := canonical.Digest()
 				if got := hex.EncodeToString(digest[:]); got != test.digestHex {
-					t.Errorf("digest = %s, want %s", got, test.digestHex)
+					t.Error("canonical digest differs from golden vector")
 				}
 			}
 		})
@@ -102,46 +102,46 @@ func TestCanonicalAlertMetaOrderingAndEmptyObject(t *testing.T) {
 
 	firstCanonical, err := CanonicalizeEvent(first)
 	if err != nil {
-		t.Fatalf("canonicalize first event: %v", err)
+		t.Fatal("first canonicalization failed")
 	}
 	secondCanonical, err := CanonicalizeEvent(second)
 	if err != nil {
-		t.Fatalf("canonicalize second event: %v", err)
+		t.Fatal("second canonicalization failed")
 	}
 	if !bytes.Equal(firstCanonical.Bytes(), secondCanonical.Bytes()) || firstCanonical.Digest() != secondCanonical.Digest() {
 		t.Fatal("map insertion order changed canonical result")
 	}
 	if !strings.HasSuffix(string(firstCanonical.Bytes()), `"Meta":{"a":"first","m":"middle","z":"last"}}`) {
-		t.Errorf("Meta keys are not in ASCII order: %s", firstCanonical.Bytes())
+		t.Error("Meta key order differs from Canonical Event Format V1")
 	}
 
 	empty := base
 	empty.Meta = map[string]string{}
 	emptyCanonical, err := CanonicalizeEvent(empty)
 	if err != nil {
-		t.Fatalf("canonicalize empty Meta: %v", err)
+		t.Fatal("empty Meta canonicalization failed")
 	}
 	if !strings.HasSuffix(string(emptyCanonical.Bytes()), `"Meta":{}}`) {
-		t.Errorf("empty Meta encoding = %s", emptyCanonical.Bytes())
+		t.Error("empty Meta encoding differs from Canonical Event Format V1")
 	}
 }
 
 func TestCanonicalUnicodeAndEscaping(t *testing.T) {
 	literal, err := decodeEvent([]byte(`{"AppName":"MS OnCall","Type":"Alert","AlertID":7,"Summary":"😀","Details":"é","ServiceID":"11111111-2222-4333-8444-555555555555","ServiceName":"Fixture Service","Meta":{"emoji":"😀"}}`))
 	if err != nil {
-		t.Fatalf("decode literal Unicode: %v", err)
+		t.Fatal("literal Unicode decoding failed")
 	}
 	escaped, err := decodeEvent([]byte(`{"AppName":"MS OnCall","Type":"Alert","AlertID":7,"Summary":"\uD83D\uDE00","Details":"\u00e9","ServiceID":"11111111-2222-4333-8444-555555555555","ServiceName":"Fixture Service","Meta":{"emoji":"\uD83D\uDE00"}}`))
 	if err != nil {
-		t.Fatalf("decode escaped Unicode: %v", err)
+		t.Fatal("escaped Unicode decoding failed")
 	}
 	literalCanonical, err := CanonicalizeEvent(literal)
 	if err != nil {
-		t.Fatalf("canonicalize literal Unicode: %v", err)
+		t.Fatal("literal Unicode canonicalization failed")
 	}
 	escapedCanonical, err := CanonicalizeEvent(escaped)
 	if err != nil {
-		t.Fatalf("canonicalize escaped Unicode: %v", err)
+		t.Fatal("escaped Unicode canonicalization failed")
 	}
 	if !bytes.Equal(literalCanonical.Bytes(), escapedCanonical.Bytes()) || literalCanonical.Digest() != escapedCanonical.Digest() {
 		t.Fatal("equivalent decoded Unicode produced different canonical output")
@@ -151,11 +151,11 @@ func TestCanonicalUnicodeAndEscaping(t *testing.T) {
 	nfd := AlertStatusEvent{AppName: "MS OnCall", AlertID: 7, LogEntry: "e\u0301", AlertState: AlertStateAcknowledged}
 	nfcCanonical, err := CanonicalizeEvent(nfc)
 	if err != nil {
-		t.Fatalf("canonicalize NFC event: %v", err)
+		t.Fatal("NFC canonicalization failed")
 	}
 	nfdCanonical, err := CanonicalizeEvent(nfd)
 	if err != nil {
-		t.Fatalf("canonicalize NFD event: %v", err)
+		t.Fatal("NFD canonicalization failed")
 	}
 	if bytes.Equal(nfcCanonical.Bytes(), nfdCanonical.Bytes()) || nfcCanonical.Digest() == nfdCanonical.Digest() {
 		t.Fatal("canonicalization silently normalized distinct Unicode forms")
@@ -169,11 +169,11 @@ func TestCanonicalUnicodeAndEscaping(t *testing.T) {
 	}
 	htmlCanonical, err := CanonicalizeEvent(htmlEvent)
 	if err != nil {
-		t.Fatalf("canonicalize escaped event: %v", err)
+		t.Fatal("escaping canonicalization failed")
 	}
 	wantFragment := `"LogEntry":"\u003cscript\u003e\u0026\u2028line\n\"quoted\"\\path"`
 	if !strings.Contains(string(htmlCanonical.Bytes()), wantFragment) {
-		t.Errorf("escaping is not fixed: %s", htmlCanonical.Bytes())
+		t.Error("string escaping differs from Canonical Event Format V1")
 	}
 }
 
@@ -195,10 +195,10 @@ func TestCanonicalEventRejectsInvalidInputsWithoutDisclosure(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			_, err := CanonicalizeEvent(test.event)
 			if !errors.Is(err, ErrCanonicalEvent) {
-				t.Fatalf("error = %v, want ErrCanonicalEvent", err)
+				t.Fatal("canonical invalid-input error does not match fixed sentinel")
 			}
 			if err != ErrCanonicalEvent {
-				t.Errorf("error must be the fixed sentinel, got %T", err)
+				t.Error("canonical invalid-input error is not the fixed sentinel")
 			}
 			if strings.Contains(err.Error(), secret) {
 				t.Error("canonicalization error disclosed event content")
@@ -220,7 +220,7 @@ func TestCanonicalEventDefensiveCopies(t *testing.T) {
 	}
 	canonical, err := CanonicalizeEvent(event)
 	if err != nil {
-		t.Fatalf("canonicalize event pointer: %v", err)
+		t.Fatal("pointer-event canonicalization failed")
 	}
 	originalBytes := canonical.Bytes()
 	originalDigest := canonical.Digest()
@@ -251,7 +251,7 @@ func TestCanonicalEventConcurrentReadIsStable(t *testing.T) {
 	}
 	want, err := CanonicalizeEvent(event)
 	if err != nil {
-		t.Fatalf("canonicalize expected event: %v", err)
+		t.Fatal("expected canonicalization failed")
 	}
 
 	var waitGroup sync.WaitGroup
