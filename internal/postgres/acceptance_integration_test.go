@@ -18,11 +18,11 @@ const integrationTestKeyID = "test-only-key"
 
 type integrationDigestOpener struct{}
 
-func (integrationDigestOpener) OpenDigest(_ context.Context, protected durable.ProtectedValue, keyID string) (durable.CanonicalDigest, error) {
-	if keyID != integrationTestKeyID || string(protected.Nonce()) != "test-only-nonce" {
+func (integrationDigestOpener) OpenDigest(_ context.Context, request durable.DigestOpenRequest) (durable.CanonicalDigest, error) {
+	if request.EncryptionKeyID != integrationTestKeyID || string(request.ProtectedDigest.Nonce()) != "test-only-nonce" {
 		return durable.CanonicalDigest{}, errors.New("test-only protected digest unavailable")
 	}
-	ciphertext := protected.Ciphertext()
+	ciphertext := request.ProtectedDigest.Ciphertext()
 	if len(ciphertext) != sha256.Size {
 		return durable.CanonicalDigest{}, errors.New("test-only protected digest invalid")
 	}
