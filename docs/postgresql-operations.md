@@ -273,3 +273,38 @@ bytes, literal digests, key IDs, connection settings, certificate paths, or SQL.
 The checkpoint supplies only the digest-opening interface seam and test fakes;
 production encryption, key injection, rotation, retention, update, deletion,
 workers, providers, and HTTP wiring remain unimplemented.
+
+## Authentication state repositories
+
+PostgreSQL Authentication State Repositories V1 implements only the accepted
+security-state interfaces for realm binding, credential lookup, principal
+lookup and shared replay reservation. Every read uses the existing single
+logical read-write pool and reconstructs domain values through their public
+constructors. A credential query begins with the public credential row and uses
+left joins so a broken principal or slot relationship cannot be reported as a
+caller-visible unknown credential. Principal disabled and intake-authorization
+flags remain separate normal record fields.
+
+Replay reservation is one parameterized insert on the exact
+`(credential_record_id, nonce_bytes)` primary key. It stores the exact decoded
+16-byte nonce and the Authentication service's one clock snapshot as
+`reserved_at`, with `expires_at` exactly five minutes later. A confirmed insert
+is reserved and a confirmed named-key conflict is duplicate. A connection
+interruption after the write begins or an unconfirmed result is outcome unknown:
+the connection is destroyed and the transaction is never replayed. A later
+top-level request makes its own decision.
+
+Only a confirmed absence of the globally unique public credential record is
+`ErrCredentialNotFound`. An audience mismatch, broken relationship, missing
+derived principal, malformed record or repository failure is a fixed
+unavailable/integrity classification. Cancellation remains recognizable, and
+unconfirmed replay completion is outcome unknown. These classifications contain
+no SQL, driver text, connection setting, identifier or nonce. Ordinary unit
+tests use fakes and no database.
+The single-instance PostgreSQL integration test is separately opt-in and is not
+HA/DR evidence; the multi-instance HA/DR test retains its independent switch.
+
+This repository checkpoint does not implement Authentication secrets,
+destination resolution, credential/token rotation, HTTP composition or runtime
+wiring. The running binary continues to use `UnavailableSink`, so otherwise
+valid webhook requests remain `503 Service Unavailable`.

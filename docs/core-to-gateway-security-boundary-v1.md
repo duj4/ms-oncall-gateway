@@ -10,9 +10,11 @@ in Gateway PR #8, merge commit
 HMAC signer foundation was accepted in Core PR #2, merge commit
 `d73e7a357f9d75a8b9c0aa7851107e860faed9d7`, but production runtime injects no
 real audience, credential or secret. The transport-independent Gateway
-Authentication V1 foundation is in review. Resolution, token rotation,
-repositories, HTTP composition, production secret sources and runtime wiring
-remain unimplemented and require separate owner authorization.
+Authentication V1 foundation was accepted in Gateway PR #9, merge commit
+`4e74094fd89273b7132bad49f734ad222feb1a8a`. PostgreSQL audience, credential,
+principal and replay repositories are a separate in-review checkpoint.
+Resolution, token rotation, HTTP composition, production secret sources and
+runtime wiring remain unimplemented and require separate owner authorization.
 
 ## Scope and fixed architecture
 
@@ -615,9 +617,11 @@ Implementation checkpoint status and remaining order are:
 2. the strict Core matcher/HMAC signer foundation is accepted in Core PR #2,
    while privileged token rotation and production credential injection remain
    unimplemented;
-3. the transport-independent Gateway Authentication V1 foundation is in review;
-4. PostgreSQL security-state repositories, shared replay persistence and Opaque
-   Destination Token V1 resolution still require separate owner authorization;
+3. the transport-independent Gateway Authentication V1 foundation is accepted
+   in Gateway PR #9;
+4. PostgreSQL audience, credential, principal and shared replay repositories
+   are in review, while Opaque Destination Token V1 resolution still requires
+   separate owner authorization;
 5. HTTP composition, production secret sources and runtime wiring follow only
    after prior checkpoints are accepted. Preserve `UnavailableSink/503` until
    then.

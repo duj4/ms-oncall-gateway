@@ -1,6 +1,7 @@
 # Gateway Authentication V1 Foundation
 
-Status: In review
+Status: Accepted by the project-owner merge of Gateway PR #9, merge commit
+`4e74094fd89273b7132bad49f734ad222feb1a8a`.
 
 This checkpoint implements only the transport-independent Authentication V1
 domain service approved by the project owner. The protocol source is
@@ -137,9 +138,14 @@ binding, inclusive timestamp boundaries, replay/principal ordering, concurrent
 duplicate reservation, defensive copies and redaction. Ordinary validation
 leaves all PostgreSQL integration variables unset and accesses no database.
 
-This checkpoint does not implement an HTTP adapter or status mapping,
-PostgreSQL security-state repository, opaque-token resolver, production secret
-provider, credential or token administration, rotation, runtime composition or
-wiring. Gateway runtime remains `UnavailableSink`; otherwise-valid webhooks
-still receive `503 Service Unavailable`. Every later stage requires separate
-project-owner authorization.
+The two formal owner-review findings were repaired before merge: repository
+integrity failures cannot become caller authentication/authorization failures,
+and ambiguous multi-cause dependency errors fail closed as unavailable.
+
+The in-review PostgreSQL Authentication State Repositories V1 checkpoint
+supplies database-backed audience, credential, principal and replay dependencies
+only. This accepted Authentication checkpoint still does not
+implement an HTTP adapter or status mapping, opaque-token resolver, production
+secret provider, credential or token administration, rotation, runtime
+composition or wiring. Gateway runtime remains `UnavailableSink`;
+otherwise-valid webhooks still receive `503 Service Unavailable`.

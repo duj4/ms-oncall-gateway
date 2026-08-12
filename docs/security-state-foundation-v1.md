@@ -7,10 +7,12 @@ This accepted checkpoint remains schema/domain-only. The strict Core
 Gateway-target matcher and HMAC signer foundation was separately accepted in
 Core PR #2, merge commit
 `d73e7a357f9d75a8b9c0aa7851107e860faed9d7`; production runtime still injects
-no real audience, credential or Authentication secret. Authentication V1 is a
-separate in-review foundation. Token rotation, Gateway repositories, token
-resolution, HTTP composition, production secret sources and runtime wiring
-remain unimplemented.
+no real audience, credential or Authentication secret. Authentication V1 was
+accepted in Gateway PR #9, merge commit
+`4e74094fd89273b7132bad49f734ad222feb1a8a`. PostgreSQL audience, credential,
+principal and replay repositories are a separate in-review checkpoint. Token
+rotation, destination-token resolution, HTTP composition, production secret
+sources and runtime wiring remain unimplemented.
 
 ## Scope and evidence
 
@@ -260,11 +262,11 @@ authentication, destination resolution or durable HTTP acceptance.
 
 Separate project-owner authorization remains required to:
 
-1. review and accept the transport-independent Gateway Authentication V1
-   foundation; the Core signer foundation is accepted but has no production
-   credential injection;
-2. implement the PostgreSQL registries and shared replay reservation, opaque
-   token resolution and the privileged Core token-only rotation operation;
+1. review the separately implemented PostgreSQL audience, credential,
+   principal and shared replay repositories; Authentication V1 and the Core
+   signer foundation are accepted but have no production credential injection;
+2. implement opaque-token resolution and the privileged Core token-only
+   rotation operation;
 3. compose those adapters with the existing acceptance pipeline and test all
    HTTP failure and concurrency boundaries;
 4. choose and wire production secret sources; and
