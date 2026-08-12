@@ -118,6 +118,13 @@ Non-sensitive log events distinguish:
 
 No SQL body or connection value is included in these events.
 
+Application schema version 2 is the additive Security State Foundation V1.
+It creates the realm binding, Core principal and credential metadata, replay
+reservations, destinations and keyed token-verifier metadata. It changes no
+version-1 table or row, seeds no realm or security identity, and stores no
+Authentication secret, raw destination token or token-verifier key material.
+`000001_initial_schema.sql` remains immutable.
+
 Rollback cleanup uses the earlier of the startup/migration deadline and a
 finite local timeout. A failed or unconfirmed rollback marks the migration
 connection unsafe: it is removed from the pool, closed with a bounded context,
@@ -161,6 +168,16 @@ missing. Re-running the initial migration is not a backup, restore or engine
 upgrade procedure. Future destructive or high-risk migrations require separate
 review and coordination with the DB team; the initial migration is additive.
 
+Version-2 backup and restore must preserve the security realm, principal,
+credential, replay, destination and token metadata together with both migration
+rows. Authentication HMAC secrets, destination-verifier keys and Payload
+Protection AES keys are external and are not recoverable from the database
+backup. Before restored instances serve traffic, operators must prove that the
+local `GatewayAudienceID` equals the restored singleton binding and that every
+required external key version is available. A wrong realm or missing key fails
+closed. Instances in one logical HA/DR realm share that audience; a restored
+clone intended as another realm must not reuse the metadata as active state.
+
 The DB team may use these read-only checks from an already authenticated
 session connected to `<gateway_database>`:
 
@@ -171,6 +188,34 @@ ORDER BY migration_version;
 
 SELECT to_regclass('gateway_schema_migrations') AS migration_metadata_table;
 SELECT to_regclass('durable_acceptances') AS durable_acceptance_foundation;
+
+SELECT gateway_audience_id, created_at
+FROM gateway_security_realm;
+
+SELECT enabled, gateway_intake_v1_authorized, count(*)
+FROM core_principals
+GROUP BY enabled, gateway_intake_v1_authorized
+ORDER BY enabled, gateway_intake_v1_authorized;
+
+SELECT credential_state, count(*)
+FROM core_authentication_credentials
+GROUP BY credential_state
+ORDER BY credential_state;
+
+SELECT count(*) AS replay_reservations,
+       min(expires_at) AS earliest_expiry,
+       max(expires_at) AS latest_expiry
+FROM authentication_replay_reservations;
+
+SELECT destination_state, count(*)
+FROM gateway_destinations
+GROUP BY destination_state
+ORDER BY destination_state;
+
+SELECT token_state, count(*)
+FROM gateway_destination_tokens
+GROUP BY token_state
+ORDER BY token_state;
 ```
 
 Do not place connection strings or credentials in inspection output or support
@@ -188,7 +233,9 @@ and the Gateway application tables. Durable-acceptance test cleanup is limited
 to `TRUNCATE durable_acceptances`; it does not create or drop a database, schema,
 role, extension, replication object, or server setting.
 
-HA/DR tests have separate enable and multi-host settings. Ordinary tests never
+HA/DR tests have separate enable and multi-host settings. A passing
+single-instance version-1-to-version-2 migration test is not failover, fencing,
+RPO, RTO or cross-DC validation. Ordinary tests never
 read the production database setting and never operate on the Core database.
 
 ## Durable acceptance persistence checkpoint

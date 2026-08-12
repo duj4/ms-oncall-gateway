@@ -1,11 +1,13 @@
 # Core to Gateway Security Boundary V1
 
-Status: Proposed in this PR. Merge by the project owner after formal review records approval as Security Boundary V1.
+Status: Approved as Security Boundary V1 by the project-owner merge of Gateway
+PR #7, merge commit `9be58c84c705fe2d47a0d03437b6bd5634016c4e`.
 
-Creating or publishing this Draft PR is not approval. Only a project-owner merge
-after formal review approves the exact Authentication V1 and Opaque Destination
-Token V1 decisions in this document. No behavior described here is implemented
-by this documentation change.
+The additive migration and domain-only seams in
+[Security State Foundation V1](security-state-foundation-v1.md) implement only
+the first separately authorized checkpoint. Authentication, resolution, Core
+signing and token rotation, HTTP composition, production secret sources and
+runtime wiring remain unimplemented and require separate owner authorization.
 
 ## Scope and fixed architecture
 
@@ -21,10 +23,10 @@ durable acceptance and future provider delivery. Gateway never reads Core
 database tables. The opaque destination token selects a Gateway destination; it
 is not Core authentication, a delivery identity or a destination address.
 
-This decision covers only the future Core-to-Gateway authentication and opaque
-destination-token boundary. It does not implement authentication, resolution,
-runtime wiring, an HTTP status change, a key source, a schema migration, a
-worker, a provider or a callback.
+This decision covers the future Core-to-Gateway authentication and opaque
+destination-token boundary. Its approved schema/domain checkpoint does not
+implement authentication, resolution, runtime wiring, an HTTP status change, a
+key source, a worker, a provider or a callback.
 
 ## Confirmed implementation evidence
 
@@ -587,17 +589,20 @@ a metric label.
 
 ## Schema and implementation implications
 
-The published `000001_initial_schema.sql` remains immutable. A future forward
-migration is required before runtime wiring to hold, at minimum, the local realm
-audience binding, principal and intake authorization state, credential metadata,
-five-minute `(credential_record_id, nonce_bytes)` replay reservations,
-destinations, token lifecycle state, keyed verifiers and verifier-key IDs.
-Authentication and verifier secret material remains outside those tables.
+The published `000001_initial_schema.sql` remains immutable. The separately
+authorized additive `000002_security_state_v1.sql` checkpoint now supplies the
+local realm audience binding, principal and intake authorization state,
+credential metadata, five-minute `(credential_record_id, nonce_bytes)` replay
+reservations, destinations, token lifecycle state, keyed verifiers and
+verifier-key IDs. Authentication and verifier secret material remains outside
+those tables. The migration and `internal/securitystate` interfaces implement
+no repository, HMAC, resolver, administration or runtime behavior.
 
 Recommended implementation order after separate owner authorization is:
 
-1. add the forward security-state migration plus domain-only audience,
-   credential, principal, replay and destination resolver interfaces and tests;
+1. **Current checkpoint:** add the forward security-state migration plus
+   domain-only audience, credential, principal, replay and destination resolver
+   interfaces and tests;
 2. implement the Core Gateway-target matcher, HMAC signer and privileged
    token-only Contact Method rotation operation with exact-byte, clock, nonce,
    queued/retry, rollback and redaction tests;
@@ -674,10 +679,11 @@ or authorize implementation of:
    required as defense in depth;
 4. support schemas and fixtures for `AlertBundle` or
    `ScheduleOnCallUsers`, which remain outside the MVP contract;
-5. authorization to create the forward security-state migration, configure a
-   unique audience per logical realm, add the narrow privileged Core token-only
-   rotation operation, change the Core signer, implement the Gateway adapter or
-   replace `UnavailableSink`.
+5. authorization to configure and bind a unique audience per logical realm,
+   add the narrow privileged Core token-only rotation operation, change the Core
+   signer, implement the Gateway repositories and adapter, or replace
+   `UnavailableSink`. The migration/domain-only foundation does not authorize
+   any of those actions.
 
 Until each implementation checkpoint is separately approved, runtime remains
 unchanged and otherwise-valid requests continue to receive `503 Service
