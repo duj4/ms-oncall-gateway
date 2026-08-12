@@ -70,15 +70,16 @@ CREATE TABLE core_authentication_credentials (
     CONSTRAINT core_authentication_credentials_state_time_order
         CHECK (
             state_changed_at >= created_at
-            AND (activated_at IS NULL OR activated_at >= created_at)
-            AND (retirement_started_at IS NULL OR (activated_at IS NOT NULL AND retirement_started_at >= activated_at))
-            AND (revoked_at IS NULL OR revoked_at >= created_at)
+            AND (activated_at IS NULL OR (activated_at >= created_at AND activated_at <= state_changed_at))
+            AND (retirement_started_at IS NULL OR (activated_at IS NOT NULL AND retirement_started_at >= activated_at AND retirement_started_at <= state_changed_at))
+            AND (revoked_at IS NULL OR (revoked_at >= created_at AND revoked_at <= state_changed_at))
         ),
     CONSTRAINT core_authentication_credentials_retirement_bound
         CHECK (
             (retirement_started_at IS NULL AND retirement_overlap_deadline IS NULL)
             OR (
                 retirement_started_at IS NOT NULL
+                AND retirement_overlap_deadline IS NOT NULL
                 AND retirement_overlap_deadline > retirement_started_at
                 AND retirement_overlap_deadline <= retirement_started_at + INTERVAL '24 hours'
             )
@@ -186,15 +187,16 @@ CREATE TABLE gateway_destination_tokens (
     CONSTRAINT gateway_destination_tokens_state_time_order
         CHECK (
             state_changed_at >= created_at
-            AND (activated_at IS NULL OR activated_at >= created_at)
-            AND (retirement_started_at IS NULL OR (activated_at IS NOT NULL AND retirement_started_at >= activated_at))
-            AND (revoked_at IS NULL OR revoked_at >= created_at)
+            AND (activated_at IS NULL OR (activated_at >= created_at AND activated_at <= state_changed_at))
+            AND (retirement_started_at IS NULL OR (activated_at IS NOT NULL AND retirement_started_at >= activated_at AND retirement_started_at <= state_changed_at))
+            AND (revoked_at IS NULL OR (revoked_at >= created_at AND revoked_at <= state_changed_at))
         ),
     CONSTRAINT gateway_destination_tokens_retirement_bound
         CHECK (
             (retirement_started_at IS NULL AND retirement_overlap_deadline IS NULL)
             OR (
                 retirement_started_at IS NOT NULL
+                AND retirement_overlap_deadline IS NOT NULL
                 AND retirement_overlap_deadline > retirement_started_at
                 AND retirement_overlap_deadline <= retirement_started_at + INTERVAL '24 hours'
             )

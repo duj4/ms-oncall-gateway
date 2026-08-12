@@ -285,7 +285,7 @@ func (value Credential) UsableAt(now time.Time) bool {
 	if value.spec.State != CredentialActive && value.spec.State != CredentialRetiring {
 		return false
 	}
-	if now.Before(value.spec.NotBefore) || !now.Before(value.spec.ExpiresAt) {
+	if now.Before(value.spec.NotBefore) || now.Before(value.spec.ActivatedAt) || !now.Before(value.spec.ExpiresAt) {
 		return false
 	}
 	return value.spec.State != CredentialRetiring || now.Before(value.spec.RetirementDeadline)
@@ -298,7 +298,10 @@ func validateCredentialSpec(spec CredentialSpec) error {
 		}
 		return ErrInvalidState
 	}
-	if spec.RecordID.IsZero() || spec.PublicID.IsZero() || spec.Slot.id.IsZero() || spec.CreatedAt.IsZero() || spec.NotBefore.Before(spec.CreatedAt) || !spec.ExpiresAt.After(spec.NotBefore) || spec.ExpiresAt.Sub(spec.NotBefore) > credentialMaxLifetime || (!spec.ActivatedAt.IsZero() && spec.ActivatedAt.Before(spec.CreatedAt)) || spec.StateChangedAt.Before(spec.CreatedAt) {
+	if spec.RecordID.IsZero() || spec.PublicID.IsZero() || spec.Slot.id.IsZero() || spec.CreatedAt.IsZero() || spec.NotBefore.Before(spec.CreatedAt) || !spec.ExpiresAt.After(spec.NotBefore) || spec.ExpiresAt.Sub(spec.NotBefore) > credentialMaxLifetime {
+		return ErrInvalidState
+	}
+	if err := validateLifecycleHistory(spec.CreatedAt, spec.StateChangedAt, spec.ActivatedAt, spec.RetirementStartedAt, spec.RetirementDeadline, spec.RevokedAt, credentialMaxOverlap); err != nil {
 		return ErrInvalidState
 	}
 	switch spec.State {
@@ -311,11 +314,11 @@ func validateCredentialSpec(spec CredentialSpec) error {
 			return ErrInvalidState
 		}
 	case CredentialRetiring:
-		if spec.ActivatedAt.IsZero() || spec.RetirementStartedAt.Before(spec.ActivatedAt) || !spec.RetirementDeadline.After(spec.RetirementStartedAt) || spec.RetirementDeadline.Sub(spec.RetirementStartedAt) > credentialMaxOverlap || !spec.RevokedAt.IsZero() {
+		if spec.ActivatedAt.IsZero() || spec.RetirementStartedAt.IsZero() || !spec.RevokedAt.IsZero() {
 			return ErrInvalidState
 		}
 	case CredentialRevoked:
-		if spec.RevokedAt.Before(spec.CreatedAt) {
+		if spec.RevokedAt.IsZero() {
 			return ErrInvalidState
 		}
 	default:
@@ -403,7 +406,10 @@ func validateDestinationTokenSpec(spec DestinationTokenSpec) error {
 		}
 		return ErrInvalidState
 	}
-	if spec.Destination.id.IsZero() || spec.RecordID.IsZero() || spec.Verifier.IsZero() || spec.VerifierKeyID.IsZero() || spec.CreatedAt.IsZero() || !spec.ExpiresAt.After(spec.CreatedAt) || spec.ExpiresAt.Sub(spec.CreatedAt) > tokenMaxLifetime || !spec.StagedCleanupDeadline.After(spec.CreatedAt) || spec.StagedCleanupDeadline.Sub(spec.CreatedAt) > tokenMaxCleanup || spec.StateChangedAt.Before(spec.CreatedAt) {
+	if spec.Destination.id.IsZero() || spec.RecordID.IsZero() || spec.Verifier.IsZero() || spec.VerifierKeyID.IsZero() || spec.CreatedAt.IsZero() || !spec.ExpiresAt.After(spec.CreatedAt) || spec.ExpiresAt.Sub(spec.CreatedAt) > tokenMaxLifetime || !spec.StagedCleanupDeadline.After(spec.CreatedAt) || spec.StagedCleanupDeadline.Sub(spec.CreatedAt) > tokenMaxCleanup {
+		return ErrInvalidState
+	}
+	if err := validateLifecycleHistory(spec.CreatedAt, spec.StateChangedAt, spec.ActivatedAt, spec.RetirementStartedAt, spec.RetirementDeadline, spec.RevokedAt, tokenMaxOverlap); err != nil {
 		return ErrInvalidState
 	}
 	switch spec.State {
@@ -412,18 +418,39 @@ func validateDestinationTokenSpec(spec DestinationTokenSpec) error {
 			return ErrInvalidState
 		}
 	case DestinationTokenActive:
-		if spec.ActivatedAt.Before(spec.CreatedAt) || !spec.RetirementStartedAt.IsZero() || !spec.RetirementDeadline.IsZero() || !spec.RevokedAt.IsZero() {
+		if spec.ActivatedAt.IsZero() || !spec.RetirementStartedAt.IsZero() || !spec.RetirementDeadline.IsZero() || !spec.RevokedAt.IsZero() {
 			return ErrInvalidState
 		}
 	case DestinationTokenRetiring:
-		if spec.ActivatedAt.Before(spec.CreatedAt) || spec.RetirementStartedAt.Before(spec.ActivatedAt) || !spec.RetirementDeadline.After(spec.RetirementStartedAt) || spec.RetirementDeadline.Sub(spec.RetirementStartedAt) > tokenMaxOverlap || !spec.RevokedAt.IsZero() {
+		if spec.ActivatedAt.IsZero() || spec.RetirementStartedAt.IsZero() || !spec.RevokedAt.IsZero() {
 			return ErrInvalidState
 		}
 	case DestinationTokenRevoked:
-		if spec.RevokedAt.Before(spec.CreatedAt) {
+		if spec.RevokedAt.IsZero() {
 			return ErrInvalidState
 		}
 	default:
+		return ErrInvalidState
+	}
+	return nil
+}
+
+func validateLifecycleHistory(createdAt, stateChangedAt, activatedAt, retirementStartedAt, retirementDeadline, revokedAt time.Time, maxRetirementOverlap time.Duration) error {
+	if createdAt.IsZero() || stateChangedAt.Before(createdAt) {
+		return ErrInvalidState
+	}
+	if !activatedAt.IsZero() && (activatedAt.Before(createdAt) || activatedAt.After(stateChangedAt)) {
+		return ErrInvalidState
+	}
+	if retirementStartedAt.IsZero() != retirementDeadline.IsZero() {
+		return ErrInvalidState
+	}
+	if !retirementStartedAt.IsZero() {
+		if activatedAt.IsZero() || retirementStartedAt.Before(activatedAt) || retirementStartedAt.After(stateChangedAt) || !retirementDeadline.After(retirementStartedAt) || retirementDeadline.Sub(retirementStartedAt) > maxRetirementOverlap {
+			return ErrInvalidState
+		}
+	}
+	if !revokedAt.IsZero() && (revokedAt.Before(createdAt) || revokedAt.After(stateChangedAt)) {
 		return ErrInvalidState
 	}
 	return nil

@@ -103,6 +103,18 @@ The lifetime from `not_before` through `expires_at` is at most 90 days. A
 retiring overlap is greater than zero and at most 24 hours. At the exact expiry
 or overlap deadline, the credential is no longer usable.
 
+An active or retiring credential is unusable before `activated_at`; the exact
+activation timestamp is inclusive when `not_before`, expiry and retirement
+conditions also permit use. Every retained lifecycle history is internally
+ordered regardless of current state: activation is between creation and the
+state change, retirement start and deadline are present together, retirement
+starts between activation and the state change with a positive overlap of at
+most 24 hours, and revocation is between creation and the state change.
+Disabled and revoked records may retain such legal history, but incomplete or
+reversed history fails closed. The Go constructors and PostgreSQL constraints
+enforce the same single-record ordering without merging `not_before`,
+activation or state-change semantics.
+
 The database contains no Authentication HMAC secret, encrypted secret,
 certificate or external secret value. A future `AuthenticationSecretSource`
 loads the Authentication-specific secret outside PostgreSQL by the approved
@@ -155,6 +167,14 @@ usable or pending token. A future repository must lock the destination row and
 check and transition the complete state set in one transaction. That
 repository and the rotation/rollback/reconciliation coordinator are not in
 this checkpoint and must not use instance-local cache.
+
+Destination-token lifecycle history follows the same single-record ordering:
+activation and revocation cannot be later than the recorded state change, and
+retirement fields must be complete, activation-backed and consistently
+ordered even when a revoked record retains history. Existing inclusive
+activation and exclusive expiry and overlap usability boundaries are
+unchanged. These row-local checks do not implement the future transactional
+cross-row no-third-token coordinator.
 
 ## Raw material and three key domains
 

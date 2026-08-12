@@ -18,7 +18,7 @@ func TestEmbeddedMigrationLayoutAndSchemas(t *testing.T) {
 		checksum string
 	}{
 		{version: 1, name: "000001_initial_schema.sql", checksum: "2a71c7da93990ec43dfb0ff1cf0a778fc7f1a4a12dac606cbcd8d2c232ae7165"},
-		{version: 2, name: "000002_security_state_v1.sql", checksum: "b336ccd2453400949f54454d8509c3f2559b93f740125e7c2f8762bc9fd0fcab"},
+		{version: 2, name: "000002_security_state_v1.sql", checksum: "848b616b3de263408f755c4bd8f0ec712c2647293b6ac3183ec5adb4a8f6c4df"},
 	} {
 		migration := migrations[index]
 		if migration.Version != expected.version || migration.Name != expected.name || migration.Checksum != expected.checksum {
@@ -106,6 +106,17 @@ func TestEmbeddedMigrationLayoutAndSchemas(t *testing.T) {
 	for _, state := range []string{"'disabled'", "'active'", "'retiring'", "'revoked'", "'staged'"} {
 		if !strings.Contains(normalized, state) {
 			t.Errorf("security migration missing lifecycle state %q", state)
+		}
+	}
+	for _, sharedLifecycleConstraint := range []string{
+		"(activated_at is null or (activated_at >= created_at and activated_at <= state_changed_at))",
+		"(retirement_started_at is null or (activated_at is not null and retirement_started_at >= activated_at and retirement_started_at <= state_changed_at))",
+		"(revoked_at is null or (revoked_at >= created_at and revoked_at <= state_changed_at))",
+		"(retirement_started_at is null and retirement_overlap_deadline is null)",
+		"or ( retirement_started_at is not null and retirement_overlap_deadline is not null and retirement_overlap_deadline > retirement_started_at",
+	} {
+		if count := strings.Count(normalized, sharedLifecycleConstraint); count != 2 {
+			t.Errorf("shared lifecycle constraint occurrence count = %d, want 2", count)
 		}
 	}
 	if count := len(regexp.MustCompile(`(?m)^create table `).FindAllString(securitySQL, -1)); count != 7 {

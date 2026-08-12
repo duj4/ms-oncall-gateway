@@ -316,12 +316,21 @@ func TestZeroValueRecordsAndInvalidTimeOrderingFailClosed(t *testing.T) {
 
 func TestCredentialStaticInvariantsAndTimeBoundaries(t *testing.T) {
 	base := validCredentialSpec(t, CredentialActive)
+	base.ActivatedAt = base.CreatedAt.Add(time.Hour)
+	base.StateChangedAt = base.ActivatedAt
 	credential, err := NewCredential(base)
 	if err != nil {
 		t.Fatal("valid active credential was rejected")
 	}
-	if credential.UsableAt(base.NotBefore.Add(-time.Nanosecond)) || !credential.UsableAt(base.NotBefore) || credential.UsableAt(base.ExpiresAt) {
-		t.Fatal("credential not-before or expiry boundary is incorrect")
+	if credential.UsableAt(base.ActivatedAt.Add(-time.Nanosecond)) || !credential.UsableAt(base.ActivatedAt) || !credential.UsableAt(base.ActivatedAt.Add(time.Nanosecond)) || credential.UsableAt(base.ExpiresAt) {
+		t.Fatal("active credential activation or expiry boundary is incorrect")
+	}
+	notBefore := validCredentialSpec(t, CredentialActive)
+	notBefore.NotBefore = notBefore.CreatedAt.Add(time.Hour)
+	notBefore.ExpiresAt = notBefore.NotBefore.Add(30 * 24 * time.Hour)
+	credential, err = NewCredential(notBefore)
+	if err != nil || credential.UsableAt(notBefore.NotBefore.Add(-time.Nanosecond)) || !credential.UsableAt(notBefore.NotBefore) {
+		t.Fatal("credential not-before boundary is incorrect")
 	}
 
 	maxLifetime := base
@@ -336,9 +345,13 @@ func TestCredentialStaticInvariantsAndTimeBoundaries(t *testing.T) {
 	}
 
 	retiring := validCredentialSpec(t, CredentialRetiring)
+	retiring.ActivatedAt = retiring.CreatedAt.Add(time.Hour)
+	retiring.RetirementStartedAt = retiring.ActivatedAt.Add(time.Hour)
+	retiring.RetirementDeadline = retiring.RetirementStartedAt.Add(credentialMaxOverlap)
+	retiring.StateChangedAt = retiring.RetirementStartedAt
 	value, err := NewCredential(retiring)
-	if err != nil || !value.UsableAt(retiring.RetirementDeadline.Add(-time.Nanosecond)) || value.UsableAt(retiring.RetirementDeadline) {
-		t.Fatal("credential retirement boundary is incorrect")
+	if err != nil || value.UsableAt(retiring.ActivatedAt.Add(-time.Nanosecond)) || !value.UsableAt(retiring.ActivatedAt) || !value.UsableAt(retiring.RetirementDeadline.Add(-time.Nanosecond)) || value.UsableAt(retiring.RetirementDeadline) {
+		t.Fatal("retiring credential activation or retirement boundary is incorrect")
 	}
 	retiring.RetirementDeadline = retiring.RetirementStartedAt.Add(credentialMaxOverlap + time.Nanosecond)
 	if _, err := NewCredential(retiring); !errors.Is(err, ErrInvalidState) {
@@ -355,6 +368,98 @@ func TestCredentialStaticInvariantsAndTimeBoundaries(t *testing.T) {
 	invalid.State = CredentialState(255)
 	if _, err := NewCredential(invalid); !errors.Is(err, ErrInvalidState) {
 		t.Fatal("invalid credential state was accepted")
+	}
+}
+
+func TestCredentialLifecycleHistoryValidation(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*CredentialSpec)
+	}{
+		{name: "activation before creation", mutate: func(spec *CredentialSpec) {
+			spec.ActivatedAt = spec.CreatedAt.Add(-time.Nanosecond)
+		}},
+		{name: "activation after state change", mutate: func(spec *CredentialSpec) {
+			spec.ActivatedAt = spec.StateChangedAt.Add(time.Nanosecond)
+		}},
+		{name: "retirement after state change", mutate: func(spec *CredentialSpec) {
+			spec.ActivatedAt = spec.CreatedAt
+			spec.RetirementStartedAt = spec.StateChangedAt.Add(time.Nanosecond)
+			spec.RetirementDeadline = spec.RetirementStartedAt.Add(time.Hour)
+		}},
+		{name: "revocation after state change", mutate: func(spec *CredentialSpec) {
+			spec.RevokedAt = spec.StateChangedAt.Add(time.Nanosecond)
+		}},
+		{name: "revocation before creation", mutate: func(spec *CredentialSpec) {
+			spec.RevokedAt = spec.CreatedAt.Add(-time.Nanosecond)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			spec := validCredentialSpec(t, CredentialRevoked)
+			test.mutate(&spec)
+			if _, err := NewCredential(spec); !errors.Is(err, ErrInvalidState) {
+				t.Fatal("invalid credential lifecycle history was accepted")
+			}
+		})
+	}
+
+	for _, state := range []CredentialState{CredentialDisabled, CredentialRevoked} {
+		for _, test := range []struct {
+			name   string
+			mutate func(*CredentialSpec)
+		}{
+			{name: "retirement without activation", mutate: func(spec *CredentialSpec) {
+				spec.RetirementStartedAt = spec.CreatedAt.Add(time.Hour)
+				spec.RetirementDeadline = spec.RetirementStartedAt.Add(time.Hour)
+				spec.StateChangedAt = spec.RetirementStartedAt
+				if state == CredentialRevoked {
+					spec.RevokedAt = spec.StateChangedAt
+				}
+			}},
+			{name: "deadline without start", mutate: func(spec *CredentialSpec) {
+				spec.ActivatedAt = spec.CreatedAt
+				spec.RetirementDeadline = spec.CreatedAt.Add(time.Hour)
+			}},
+			{name: "start without deadline", mutate: func(spec *CredentialSpec) {
+				spec.ActivatedAt = spec.CreatedAt
+				spec.RetirementStartedAt = spec.CreatedAt.Add(time.Hour)
+				spec.StateChangedAt = spec.RetirementStartedAt
+				if state == CredentialRevoked {
+					spec.RevokedAt = spec.StateChangedAt
+				}
+			}},
+			{name: "retirement before activation", mutate: func(spec *CredentialSpec) {
+				spec.ActivatedAt = spec.CreatedAt.Add(2 * time.Hour)
+				spec.RetirementStartedAt = spec.CreatedAt.Add(time.Hour)
+				spec.RetirementDeadline = spec.RetirementStartedAt.Add(time.Hour)
+				spec.StateChangedAt = spec.ActivatedAt
+				if state == CredentialRevoked {
+					spec.RevokedAt = spec.StateChangedAt
+				}
+			}},
+		} {
+			t.Run(fmt.Sprintf("state_%d/%s", state, test.name), func(t *testing.T) {
+				spec := validCredentialSpec(t, state)
+				test.mutate(&spec)
+				if _, err := NewCredential(spec); !errors.Is(err, ErrInvalidState) {
+					t.Fatal("malformed credential history was accepted")
+				}
+			})
+		}
+
+		t.Run(fmt.Sprintf("state_%d/legal_history", state), func(t *testing.T) {
+			spec := validCredentialSpec(t, state)
+			spec.ActivatedAt = spec.CreatedAt
+			spec.RetirementStartedAt = spec.CreatedAt.Add(time.Hour)
+			spec.RetirementDeadline = spec.RetirementStartedAt.Add(time.Hour)
+			spec.StateChangedAt = spec.RetirementStartedAt
+			if state == CredentialRevoked {
+				spec.RevokedAt = spec.StateChangedAt
+			}
+			if _, err := NewCredential(spec); err != nil {
+				t.Fatal("legal credential history was rejected")
+			}
+		})
 	}
 }
 
@@ -405,9 +510,13 @@ func TestDestinationAndTokenStaticInvariants(t *testing.T) {
 	}
 
 	retiring := validTokenSpec(t, DestinationTokenRetiring)
+	retiring.ActivatedAt = retiring.CreatedAt.Add(time.Hour)
+	retiring.RetirementStartedAt = retiring.ActivatedAt.Add(time.Hour)
+	retiring.RetirementDeadline = retiring.RetirementStartedAt.Add(tokenMaxOverlap)
+	retiring.StateChangedAt = retiring.RetirementStartedAt
 	retiringToken, err := NewDestinationToken(retiring)
-	if err != nil || !retiringToken.UsableAt(retiring.RetirementDeadline.Add(-time.Nanosecond)) || retiringToken.UsableAt(retiring.RetirementDeadline) {
-		t.Fatal("retiring token overlap boundary is incorrect")
+	if err != nil || retiringToken.UsableAt(retiring.ActivatedAt.Add(-time.Nanosecond)) || !retiringToken.UsableAt(retiring.ActivatedAt) || !retiringToken.UsableAt(retiring.RetirementDeadline.Add(-time.Nanosecond)) || retiringToken.UsableAt(retiring.RetirementDeadline) {
+		t.Fatal("retiring token activation or overlap boundary is incorrect")
 	}
 	retiring.RetirementDeadline = retiring.RetirementStartedAt.Add(tokenMaxOverlap + time.Nanosecond)
 	if _, err := NewDestinationToken(retiring); !errors.Is(err, ErrInvalidState) {
@@ -419,6 +528,72 @@ func TestDestinationAndTokenStaticInvariants(t *testing.T) {
 		if createErr != nil || value.UsableAt(active.ActivatedAt) {
 			t.Fatal("staged or revoked token was usable")
 		}
+	}
+}
+
+func TestRevokedDestinationTokenLifecycleHistoryValidation(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*DestinationTokenSpec)
+	}{
+		{name: "activation before creation", mutate: func(spec *DestinationTokenSpec) {
+			spec.ActivatedAt = spec.CreatedAt.Add(-time.Nanosecond)
+		}},
+		{name: "activation after state change", mutate: func(spec *DestinationTokenSpec) {
+			spec.ActivatedAt = spec.StateChangedAt.Add(time.Nanosecond)
+		}},
+		{name: "retirement after state change", mutate: func(spec *DestinationTokenSpec) {
+			spec.ActivatedAt = spec.CreatedAt
+			spec.RetirementStartedAt = spec.StateChangedAt.Add(time.Nanosecond)
+			spec.RetirementDeadline = spec.RetirementStartedAt.Add(time.Hour)
+		}},
+		{name: "revocation after state change", mutate: func(spec *DestinationTokenSpec) {
+			spec.RevokedAt = spec.StateChangedAt.Add(time.Nanosecond)
+		}},
+		{name: "revocation before creation", mutate: func(spec *DestinationTokenSpec) {
+			spec.RevokedAt = spec.CreatedAt.Add(-time.Nanosecond)
+		}},
+		{name: "retirement without activation", mutate: func(spec *DestinationTokenSpec) {
+			spec.RetirementStartedAt = spec.CreatedAt.Add(time.Hour)
+			spec.RetirementDeadline = spec.RetirementStartedAt.Add(time.Hour)
+			spec.StateChangedAt = spec.RetirementStartedAt
+			spec.RevokedAt = spec.StateChangedAt
+		}},
+		{name: "deadline without start", mutate: func(spec *DestinationTokenSpec) {
+			spec.ActivatedAt = spec.CreatedAt
+			spec.RetirementDeadline = spec.CreatedAt.Add(time.Hour)
+		}},
+		{name: "start without deadline", mutate: func(spec *DestinationTokenSpec) {
+			spec.ActivatedAt = spec.CreatedAt
+			spec.RetirementStartedAt = spec.CreatedAt.Add(time.Hour)
+			spec.StateChangedAt = spec.RetirementStartedAt
+			spec.RevokedAt = spec.StateChangedAt
+		}},
+		{name: "retirement before activation", mutate: func(spec *DestinationTokenSpec) {
+			spec.ActivatedAt = spec.CreatedAt.Add(2 * time.Hour)
+			spec.RetirementStartedAt = spec.CreatedAt.Add(time.Hour)
+			spec.RetirementDeadline = spec.RetirementStartedAt.Add(time.Hour)
+			spec.StateChangedAt = spec.ActivatedAt
+			spec.RevokedAt = spec.StateChangedAt
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			spec := validTokenSpec(t, DestinationTokenRevoked)
+			test.mutate(&spec)
+			if _, err := NewDestinationToken(spec); !errors.Is(err, ErrInvalidState) {
+				t.Fatal("malformed destination-token history was accepted")
+			}
+		})
+	}
+
+	legal := validTokenSpec(t, DestinationTokenRevoked)
+	legal.ActivatedAt = legal.CreatedAt
+	legal.RetirementStartedAt = legal.CreatedAt.Add(time.Hour)
+	legal.RetirementDeadline = legal.RetirementStartedAt.Add(time.Hour)
+	legal.StateChangedAt = legal.RetirementStartedAt
+	legal.RevokedAt = legal.StateChangedAt
+	if _, err := NewDestinationToken(legal); err != nil {
+		t.Fatal("legal destination-token history was rejected")
 	}
 }
 
@@ -565,8 +740,10 @@ func validCredentialSpec(t *testing.T, state CredentialState) CredentialSpec {
 		spec.ActivatedAt = created
 		spec.RetirementStartedAt = created.Add(time.Hour)
 		spec.RetirementDeadline = spec.RetirementStartedAt.Add(credentialMaxOverlap)
+		spec.StateChangedAt = spec.RetirementStartedAt
 	case CredentialRevoked:
 		spec.RevokedAt = created.Add(time.Hour)
+		spec.StateChangedAt = spec.RevokedAt
 	}
 	return spec
 }
@@ -618,8 +795,10 @@ func validTokenSpec(t *testing.T, state DestinationTokenState) DestinationTokenS
 		spec.ActivatedAt = created
 		spec.RetirementStartedAt = created.Add(time.Hour)
 		spec.RetirementDeadline = spec.RetirementStartedAt.Add(tokenMaxOverlap)
+		spec.StateChangedAt = spec.RetirementStartedAt
 	case DestinationTokenRevoked:
 		spec.RevokedAt = created.Add(time.Hour)
+		spec.StateChangedAt = spec.RevokedAt
 	}
 	return spec
 }
