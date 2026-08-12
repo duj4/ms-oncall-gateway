@@ -2,11 +2,13 @@
 
 Status: Draft contract for the MS OnCall Gateway MVP.
 
-The proposed [Core to Gateway Security Boundary V1](core-to-gateway-security-boundary-v1.md)
-selects one exact Authentication V1 and Opaque Destination Token V1. The
-proposal is not approved by Draft PR creation; project-owner merge after formal
-review records approval. Neither security mechanism is implemented in the
-current runtime.
+The project owner approved
+[Core to Gateway Security Boundary V1](core-to-gateway-security-boundary-v1.md)
+by merging Gateway PR #7 at
+`9be58c84c705fe2d47a0d03437b6bd5634016c4e`. The separately authorized
+[Security State Foundation V1](security-state-foundation-v1.md) adds only the
+schema and transport-independent domain seams. Neither Authentication V1 nor
+Opaque Destination Token V1 resolution is implemented in the current runtime.
 
 Upstream baseline: GoAlert v0.34.1 at commit
 `0918387e38650aaddd6a923d445ee992f64d6ab6`. This contract also documents
@@ -62,15 +64,13 @@ single path segment and MUST NOT contain an email address, telephone number,
 provider credential, or other clear-text destination. It is routing material,
 not sufficient request authentication.
 
-The security-boundary proposal gives the token the canonical form `mso1_`
+The approved security boundary gives the token the canonical form `mso1_`
 followed by unpadded base64url encoding of 32 CSPRNG bytes and stores only a
-separately keyed HMAC-SHA-256 verifier. That format and lifecycle become
-normative only if the project owner merges the decision PR after formal review.
-The verifier is also bound to the deployment-configured canonical
+separately keyed HMAC-SHA-256 verifier. The verifier is also bound to the deployment-configured canonical
 `GatewayAudienceID`; the audience is never supplied by the request.
 
 The existing normal Core Contact Method update remains destination-immutable.
-The proposal requires a separate admin/system-only, Gateway-specific future
+The approved boundary requires a separate admin/system-only, Gateway-specific future
 operation for token rotation. It preserves the Contact Method UUID, owner,
 notification rules, escalation references, disabled/status-update state,
 origin and route, and atomically replaces only the canonical opaque token after
@@ -207,12 +207,12 @@ contract and fixture update.
 ## Authentication boundary
 
 Core-to-Gateway authentication is independent of the opaque destination token.
-The linked Security Boundary V1 proposes exactly one mechanism:
+The linked approved Security Boundary V1 selects exactly one mechanism:
 HMAC-SHA-256 signing of the exact request over verified TLS, using a scoped
 credential ID, signed timestamp and fresh attempt nonce. It has no bearer,
-client-certificate-identity or trusted-principal-header fallback. The HMAC
-proposal becomes normative only when the project owner merges the decision PR;
-it is not implemented by this contract update.
+client-certificate-identity or trusted-principal-header fallback. The schema and
+domain foundation do not implement HMAC verification, replay reservation,
+principal authorization or destination resolution.
 
 Regardless of the selected mechanism:
 
@@ -416,21 +416,20 @@ implemented:
 The `Idempotency-Key: <outgoing_messages.id>` delivery-identity binding and
 the prohibition on no-ID sends are approved and are no longer decision items.
 
-1. **Security Boundary V1 owner decision.** The linked decision proposal
+1. **Security Boundary V1 implementation checkpoints.** The approved boundary
    uniquely selects HMAC-signed requests over verified TLS and a 256-bit opaque
-   token backed by a separate keyed HMAC verifier. Draft publication is not
-   approval. Project-owner merge after formal review approves those exact
-   choices; until then the opaque token remains insufficient authentication and
-   both mechanisms remain unimplemented.
+   token backed by a separate keyed HMAC verifier. Migration/domain types do not
+   authenticate a request. Core signing, Gateway repositories, authenticator,
+   resolver, secret sources, HTTP composition and runtime wiring each require
+   separate owner authorization.
 2. **Additional Core event types.** Confirm that `AlertBundle` and
    `ScheduleOnCallUsers` remain rejected for the Gateway MVP, or approve
    schemas and fixtures for them.
-3. **Implementation prerequisites after decision approval.** Select concrete
-   production secret sources and separately authorize the forward security
-   migration, unique deployment audience, Core signer, narrow privileged
-   Gateway-token rotation operation, Gateway authenticator/resolver and final
-   runtime wiring. No implementation is authorized by merging documentation
-   alone.
+3. **Remaining implementation prerequisites.** Select concrete production
+   secret sources and separately authorize binding a unique deployment
+   audience, the Core signer, narrow privileged Gateway-token rotation
+   operation, Gateway repositories/authenticator/resolver and final runtime
+   wiring. The completed schema/domain foundation authorizes none of them.
 
 The machine-readable `AlertState` field and its three case-sensitive values
 are owner-approved and are no longer a decision item. Until the remaining
