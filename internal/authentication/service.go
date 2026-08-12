@@ -124,14 +124,19 @@ func (service *Service) Authenticate(ctx context.Context, request Request) (Resu
 		return Result{}, ErrCanceled
 	}
 	if dependencyErr != nil {
-		if errors.Is(dependencyErr, securitystate.ErrCredentialNotFound) ||
-			errors.Is(dependencyErr, securitystate.ErrInvalidState) ||
+		if errors.Is(dependencyErr, securitystate.ErrInvalidState) ||
 			errors.Is(dependencyErr, securitystate.ErrAudienceMismatch) {
+			return Result{}, ErrUnavailable
+		}
+		if errors.Is(dependencyErr, securitystate.ErrCredentialNotFound) {
 			return Result{}, ErrAuthenticationFailed
 		}
 		return Result{}, ErrUnavailable
 	}
-	if !validCredential(credential, service.configuredAudience, parsed.credentialID, now) {
+	if !credentialRecordValid(credential, service.configuredAudience, parsed.credentialID) {
+		return Result{}, ErrUnavailable
+	}
+	if !credential.UsableAt(now) {
 		return Result{}, ErrAuthenticationFailed
 	}
 
@@ -184,9 +189,13 @@ func (service *Service) Authenticate(ctx context.Context, request Request) (Resu
 		}
 		return Result{}, ErrUnavailable
 	}
-	if principal.ID() != credential.PrincipalID() ||
-		principal.AudienceID() != service.configuredAudience ||
-		!principal.AuthorizesIntake(service.configuredAudience) {
+	if principal.ID().IsZero() ||
+		principal.AudienceID().IsZero() ||
+		principal.ID() != credential.PrincipalID() ||
+		principal.AudienceID() != service.configuredAudience {
+		return Result{}, ErrUnavailable
+	}
+	if !principal.Enabled() || !principal.IntakeAuthorized() {
 		return Result{}, ErrForbidden
 	}
 
@@ -298,18 +307,27 @@ func parseTimestamp(value string) (uint64, bool) {
 	return parsed, err == nil
 }
 
-func validCredential(
+func credentialRecordValid(
 	credential securitystate.Credential,
 	audience securitystate.GatewayAudienceID,
 	publicID securitystate.CredentialID,
-	now time.Time,
 ) bool {
-	return credential.PublicID() == publicID &&
-		credential.AudienceID() == audience &&
-		!credential.PrincipalID().IsZero() &&
-		!credential.SlotID().IsZero() &&
-		!credential.RecordID().IsZero() &&
-		credential.UsableAt(now)
+	if credential.PublicID() != publicID ||
+		credential.AudienceID() != audience ||
+		credential.PrincipalID().IsZero() ||
+		credential.SlotID().IsZero() ||
+		credential.RecordID().IsZero() {
+		return false
+	}
+	switch credential.State() {
+	case securitystate.CredentialDisabled,
+		securitystate.CredentialActive,
+		securitystate.CredentialRetiring,
+		securitystate.CredentialRevoked:
+		return true
+	default:
+		return false
+	}
 }
 
 func requestMAC(audience string, request parsedRequest, secret [sha256.Size]byte) [sha256.Size]byte {

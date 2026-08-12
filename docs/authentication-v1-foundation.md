@@ -86,8 +86,9 @@ once and then performs these narrow calls in order:
 1. read the current realm binding and require an exact configured-audience
    match;
 2. look up the credential by configured audience and public credential ID;
-3. require matching IDs and audience plus an active or retiring credential
-   usable at that clock snapshot;
+3. require a structurally complete credential record with matching public ID
+   and audience, then require an active or retiring credential usable at that
+   clock snapshot;
 4. obtain the independent 32-byte Authentication secret by configured audience
    and public credential ID;
 5. verify the exact HMAC and then the timestamp window;
@@ -101,6 +102,13 @@ ambiguous outcome or an illegal disposition fails closed as unavailable. A
 forbidden principal is evaluated only after successful reservation. Context is
 checked between dependency calls. The service caches no audience, credential,
 principal, revocation or replay result.
+
+A deterministically unknown credential and a correctly bound but
+lifecycle-unusable credential are authentication failures. A correctly bound
+principal that is disabled or lacks `gateway.intake.v1` is forbidden. In
+contrast, credential/principal repository failures, structurally invalid
+records, or records bound to an unexpected ID or audience are server-side
+integrity failures and fail closed as unavailable.
 
 ## Safe errors
 

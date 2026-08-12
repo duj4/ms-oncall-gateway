@@ -588,18 +588,32 @@ func TestAudienceCredentialAndSecretBoundaries(t *testing.T) {
 			fixture.boundAudience = mustAudience(t, testOnlyOtherAudience)
 		}, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience"}},
 		{name: "credential unknown", configure: func(_ *testing.T, fixture *testFixture) { fixture.credentialErr = securitystate.ErrCredentialNotFound }, expected: ErrAuthenticationFailed, expectedOrder: []string{"clock", "audience", "credential"}},
+		{name: "credential unknown wrapped", configure: func(_ *testing.T, fixture *testFixture) {
+			fixture.credentialErr = fmt.Errorf("%s: %w", testOnlyDependencyMarker, securitystate.ErrCredentialNotFound)
+		}, expected: ErrAuthenticationFailed, expectedOrder: []string{"clock", "audience", "credential"}},
+		{name: "credential invalid state", configure: func(_ *testing.T, fixture *testFixture) { fixture.credentialErr = securitystate.ErrInvalidState }, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential"}},
+		{name: "credential invalid state wrapped", configure: func(_ *testing.T, fixture *testFixture) {
+			fixture.credentialErr = fmt.Errorf("%s: %w", testOnlyDependencyMarker, securitystate.ErrInvalidState)
+		}, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential"}},
+		{name: "credential dependency audience mismatch", configure: func(_ *testing.T, fixture *testFixture) { fixture.credentialErr = securitystate.ErrAudienceMismatch }, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential"}},
+		{name: "credential dependency audience mismatch wrapped", configure: func(_ *testing.T, fixture *testFixture) {
+			fixture.credentialErr = fmt.Errorf("%s: %w", testOnlyDependencyMarker, securitystate.ErrAudienceMismatch)
+		}, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential"}},
+		{name: "credential ambiguous not found and invalid state", configure: func(_ *testing.T, fixture *testFixture) {
+			fixture.credentialErr = errors.Join(securitystate.ErrCredentialNotFound, securitystate.ErrInvalidState)
+		}, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential"}},
 		{name: "credential repository unavailable", configure: func(_ *testing.T, fixture *testFixture) { fixture.credentialErr = errors.New(testOnlyDependencyMarker) }, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential"}},
 		{name: "credential public mismatch", configure: func(t *testing.T, fixture *testFixture) {
 			fixture.credential = mustCredential(t, fixture.audience, fixture.principal, testOnlyOtherCredential, securitystate.CredentialActive, fixture.now)
-		}, expected: ErrAuthenticationFailed, expectedOrder: []string{"clock", "audience", "credential"}},
+		}, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential"}},
 		{name: "credential audience mismatch", configure: func(t *testing.T, fixture *testFixture) {
 			otherAudience := mustAudience(t, testOnlyOtherAudience)
 			otherPrincipal := mustPrincipal(t, otherAudience, testOnlyPrincipal, true, true, fixture.now)
 			fixture.credential = mustCredential(t, otherAudience, otherPrincipal, testOnlyCredential, securitystate.CredentialActive, fixture.now)
-		}, expected: ErrAuthenticationFailed, expectedOrder: []string{"clock", "audience", "credential"}},
+		}, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential"}},
 		{name: "credential malformed", configure: func(_ *testing.T, fixture *testFixture) {
 			fixture.credential = securitystate.Credential{}
-		}, expected: ErrAuthenticationFailed, expectedOrder: []string{"clock", "audience", "credential"}},
+		}, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential"}},
 		{name: "credential disabled", configure: func(t *testing.T, fixture *testFixture) {
 			fixture.credential = mustCredential(t, fixture.audience, fixture.principal, testOnlyCredential, securitystate.CredentialDisabled, fixture.now)
 		}, expected: ErrAuthenticationFailed, expectedOrder: []string{"clock", "audience", "credential"}},
@@ -645,8 +659,13 @@ func TestAudienceCredentialAndSecretBoundaries(t *testing.T) {
 				t.Fatal("test service construction failed")
 			}
 			_, err = service.Authenticate(context.Background(), goldenRequest())
-			if !errors.Is(err, test.expected) || errors.Is(err, errors.New(testOnlyDependencyMarker)) {
+			if err != test.expected || strings.Contains(err.Error(), testOnlyDependencyMarker) {
 				t.Fatal("dependency error classification mismatch")
+			}
+			for _, dependencyErr := range []error{fixture.audienceErr, fixture.credentialErr, fixture.secretErr} {
+				if dependencyErr != nil && errors.Is(err, dependencyErr) {
+					t.Fatal("dependency error remained in returned error chain")
+				}
 			}
 			if !equalStrings(fixture.recordedOrder(), test.expectedOrder) {
 				t.Fatal("dependency stop boundary mismatch")
@@ -661,12 +680,17 @@ func TestCredentialLifecycleBoundaries(t *testing.T) {
 		mutateSpec func(*securitystate.CredentialSpec, time.Time)
 		wantOK     bool
 	}{
+		{name: "disabled", mutateSpec: func(spec *securitystate.CredentialSpec, _ time.Time) { spec.State = securitystate.CredentialDisabled }},
 		{name: "not before exact", mutateSpec: func(spec *securitystate.CredentialSpec, now time.Time) { spec.NotBefore = now }, wantOK: true},
 		{name: "not before future", mutateSpec: func(spec *securitystate.CredentialSpec, now time.Time) { spec.NotBefore = now.Add(time.Second) }},
 		{name: "activation exact", mutateSpec: func(spec *securitystate.CredentialSpec, now time.Time) {
 			spec.ActivatedAt = now
 			spec.StateChangedAt = now
 		}, wantOK: true},
+		{name: "activation future", mutateSpec: func(spec *securitystate.CredentialSpec, now time.Time) {
+			spec.ActivatedAt = now.Add(time.Second)
+			spec.StateChangedAt = spec.ActivatedAt
+		}},
 		{name: "expiry exact", mutateSpec: func(spec *securitystate.CredentialSpec, now time.Time) { spec.ExpiresAt = now }},
 		{name: "retirement exact", mutateSpec: func(spec *securitystate.CredentialSpec, now time.Time) {
 			spec.State = securitystate.CredentialRetiring
@@ -680,6 +704,11 @@ func TestCredentialLifecycleBoundaries(t *testing.T) {
 			spec.RetirementDeadline = now.Add(time.Second)
 			spec.StateChangedAt = spec.RetirementStartedAt
 		}, wantOK: true},
+		{name: "revoked", mutateSpec: func(spec *securitystate.CredentialSpec, now time.Time) {
+			spec.State = securitystate.CredentialRevoked
+			spec.RevokedAt = now.Add(-30 * time.Minute)
+			spec.StateChangedAt = spec.RevokedAt
+		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -695,8 +724,15 @@ func TestCredentialLifecycleBoundaries(t *testing.T) {
 			if test.wantOK && err != nil {
 				t.Fatal("valid credential boundary was rejected")
 			}
-			if !test.wantOK && !errors.Is(err, ErrAuthenticationFailed) {
+			if !test.wantOK && err != ErrAuthenticationFailed {
 				t.Fatal("invalid credential boundary was accepted")
+			}
+			expectedOrder := []string{"clock", "audience", "credential"}
+			if test.wantOK {
+				expectedOrder = append(expectedOrder, "secret", "replay", "principal")
+			}
+			if !equalStrings(fixture.recordedOrder(), expectedOrder) {
+				t.Fatal("credential lifecycle crossed dependency boundary")
 			}
 		})
 	}
@@ -764,43 +800,52 @@ func TestReplayAndPrincipalBoundaries(t *testing.T) {
 		name          string
 		configure     func(*testing.T, *testFixture)
 		expected      error
-		principalCall bool
+		expectedOrder []string
 	}{
-		{name: "duplicate", configure: func(_ *testing.T, fixture *testFixture) { fixture.replayResult = securitystate.ReplayDuplicate }, expected: ErrAuthenticationFailed},
-		{name: "replay unavailable", configure: func(_ *testing.T, fixture *testFixture) { fixture.replayErr = securitystate.ErrReplayUnavailable }, expected: ErrUnavailable},
-		{name: "replay unknown", configure: func(_ *testing.T, fixture *testFixture) { fixture.replayErr = securitystate.ErrReplayOutcomeUnknown }, expected: ErrUnavailable},
-		{name: "illegal replay result", configure: func(_ *testing.T, fixture *testFixture) { fixture.replayResult = 99 }, expected: ErrUnavailable},
+		{name: "matching enabled authorized", configure: func(_ *testing.T, _ *testFixture) {}, expectedOrder: []string{"clock", "audience", "credential", "secret", "replay", "principal"}},
+		{name: "duplicate", configure: func(_ *testing.T, fixture *testFixture) { fixture.replayResult = securitystate.ReplayDuplicate }, expected: ErrAuthenticationFailed, expectedOrder: []string{"clock", "audience", "credential", "secret", "replay"}},
+		{name: "replay unavailable", configure: func(_ *testing.T, fixture *testFixture) { fixture.replayErr = securitystate.ErrReplayUnavailable }, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential", "secret", "replay"}},
+		{name: "replay unknown", configure: func(_ *testing.T, fixture *testFixture) { fixture.replayErr = securitystate.ErrReplayOutcomeUnknown }, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential", "secret", "replay"}},
+		{name: "illegal replay result", configure: func(_ *testing.T, fixture *testFixture) { fixture.replayResult = 99 }, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential", "secret", "replay"}},
 		{name: "principal disabled", configure: func(t *testing.T, fixture *testFixture) {
 			fixture.principal = mustPrincipal(t, fixture.audience, testOnlyPrincipal, false, true, fixture.now)
-		}, expected: ErrForbidden, principalCall: true},
+		}, expected: ErrForbidden, expectedOrder: []string{"clock", "audience", "credential", "secret", "replay", "principal"}},
 		{name: "principal unauthorized", configure: func(t *testing.T, fixture *testFixture) {
 			fixture.principal = mustPrincipal(t, fixture.audience, testOnlyPrincipal, true, false, fixture.now)
-		}, expected: ErrForbidden, principalCall: true},
+		}, expected: ErrForbidden, expectedOrder: []string{"clock", "audience", "credential", "secret", "replay", "principal"}},
 		{name: "principal ID mismatch", configure: func(t *testing.T, fixture *testFixture) {
 			fixture.principal = mustPrincipal(t, fixture.audience, testOnlyOtherPrincipal, true, true, fixture.now)
-		}, expected: ErrForbidden, principalCall: true},
+		}, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential", "secret", "replay", "principal"}},
 		{name: "principal audience mismatch", configure: func(t *testing.T, fixture *testFixture) {
 			fixture.principal = mustPrincipal(t, mustAudience(t, testOnlyOtherAudience), testOnlyPrincipal, true, true, fixture.now)
-		}, expected: ErrForbidden, principalCall: true},
-		{name: "principal unavailable", configure: func(_ *testing.T, fixture *testFixture) { fixture.principalErr = errors.New(testOnlyDependencyMarker) }, expected: ErrUnavailable, principalCall: true},
+		}, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential", "secret", "replay", "principal"}},
+		{name: "principal malformed", configure: func(_ *testing.T, fixture *testFixture) {
+			fixture.principal = securitystate.Principal{}
+		}, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential", "secret", "replay", "principal"}},
+		{name: "principal unavailable", configure: func(_ *testing.T, fixture *testFixture) { fixture.principalErr = errors.New(testOnlyDependencyMarker) }, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential", "secret", "replay", "principal"}},
 		{name: "principal explicitly forbidden", configure: func(_ *testing.T, fixture *testFixture) {
 			fixture.principalErr = securitystate.ErrPrincipalNotAuthorized
-		}, expected: ErrForbidden, principalCall: true},
+		}, expected: ErrForbidden, expectedOrder: []string{"clock", "audience", "credential", "secret", "replay", "principal"}},
+		{name: "principal explicitly forbidden wrapped", configure: func(_ *testing.T, fixture *testFixture) {
+			fixture.principalErr = fmt.Errorf("%s: %w", testOnlyDependencyMarker, securitystate.ErrPrincipalNotAuthorized)
+		}, expected: ErrForbidden, expectedOrder: []string{"clock", "audience", "credential", "secret", "replay", "principal"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newTestFixture(t)
 			test.configure(t, fixture)
 			_, err := fixture.service(t).Authenticate(context.Background(), goldenRequest())
-			if !errors.Is(err, test.expected) {
+			if err != test.expected || (err != nil && strings.Contains(err.Error(), testOnlyDependencyMarker)) {
 				t.Fatal("replay or principal classification mismatch")
 			}
-			order := fixture.recordedOrder()
-			if containsString(order, "principal") != test.principalCall {
-				t.Fatal("principal lookup boundary mismatch")
+			for _, dependencyErr := range []error{fixture.replayErr, fixture.principalErr} {
+				if dependencyErr != nil && errors.Is(err, dependencyErr) {
+					t.Fatal("dependency error remained in returned error chain")
+				}
 			}
-			if test.principalCall && (!containsString(order, "replay") || indexOf(order, "replay") > indexOf(order, "principal")) {
-				t.Fatal("principal lookup occurred before reservation")
+			order := fixture.recordedOrder()
+			if !equalStrings(order, test.expectedOrder) {
+				t.Fatal("replay or principal dependency order mismatch")
 			}
 		})
 	}
