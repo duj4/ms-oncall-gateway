@@ -20,9 +20,11 @@ var (
 	ErrMigration     = errors.New("database migration failed")
 	// ErrMigrationInterrupted is intentionally more specific than
 	// ErrMigration, so callers can fail closed on an unknown execution result.
-	ErrMigrationInterrupted = fmt.Errorf("%w: interrupted", ErrMigration)
-	ErrSchemaAhead          = errors.New("database schema is ahead")
-	ErrSchemaInvalid        = errors.New("database schema is invalid")
+	ErrMigrationInterrupted           = fmt.Errorf("%w: interrupted", ErrMigration)
+	ErrSchemaAhead                    = errors.New("database schema is ahead")
+	ErrSchemaInvalid                  = errors.New("database schema is invalid")
+	ErrAuthenticationStateUnavailable = errors.New("database authentication state unavailable")
+	ErrAuthenticationStateIntegrity   = errors.New("database authentication state invalid")
 )
 
 // SafeError deliberately retains only bounded, non-sensitive diagnostic data.
@@ -70,11 +72,15 @@ func isConnectionInterruption(err error) bool {
 	var postgresError *pgconn.PgError
 	if errors.As(err, &postgresError) {
 		// SQLSTATE class 08 and server shutdown/crash states indicate a broken
-		// session. Ordinary SQL, DDL, permission, and constraint errors do not.
+		// session. 40003 explicitly means statement completion is unknown.
+		// Ordinary SQL, DDL, permission, and constraint errors do not.
 		return strings.HasPrefix(postgresError.Code, "08") ||
+			postgresError.Code == "40003" ||
 			postgresError.Code == "57P01" ||
 			postgresError.Code == "57P02" ||
-			postgresError.Code == "57P03"
+			postgresError.Code == "57P03" ||
+			postgresError.Code == "57P04" ||
+			postgresError.Code == "57P05"
 	}
 
 	var connectError *pgconn.ConnectError
