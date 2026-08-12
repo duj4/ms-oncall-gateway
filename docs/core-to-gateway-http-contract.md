@@ -2,6 +2,12 @@
 
 Status: Draft contract for the MS OnCall Gateway MVP.
 
+The proposed [Core to Gateway Security Boundary V1](core-to-gateway-security-boundary-v1.md)
+selects one exact Authentication V1 and Opaque Destination Token V1. The
+proposal is not approved by Draft PR creation; project-owner merge after formal
+review records approval. Neither security mechanism is implemented in the
+current runtime.
+
 Upstream baseline: GoAlert v0.34.1 at commit
 `0918387e38650aaddd6a923d445ee992f64d6ab6`. This contract also documents
 owner-approved additive MS OnCall wire extensions to that baseline.
@@ -55,6 +61,11 @@ allowed; the next byte makes the request too large.
 single path segment and MUST NOT contain an email address, telephone number,
 provider credential, or other clear-text destination. It is routing material,
 not sufficient request authentication.
+
+The security-boundary proposal gives the token the canonical form `mso1_`
+followed by unpadded base64url encoding of 32 CSPRNG bytes and stores only a
+separately keyed HMAC-SHA-256 verifier. That format and lifecycle become
+normative only if the project owner merges the decision PR after formal review.
 
 Core v0.34.1 has a three-second webhook request timeout. Gateway intake MUST
 not wait for provider delivery. This timeout is a compatibility constraint,
@@ -177,8 +188,12 @@ contract and fixture update.
 ## Authentication boundary
 
 Core-to-Gateway authentication is independent of the opaque destination token.
-The exact mechanism is not yet approved and is listed under
-[Decision required](#decision-required).
+The linked Security Boundary V1 proposes exactly one mechanism:
+HMAC-SHA-256 signing of the exact request over verified TLS, using a scoped
+credential ID, signed timestamp and fresh attempt nonce. It has no bearer,
+client-certificate-identity or trusted-principal-header fallback. The HMAC
+proposal becomes normative only when the project owner merges the decision PR;
+it is not implemented by this contract update.
 
 Regardless of the selected mechanism:
 
@@ -193,6 +208,16 @@ Regardless of the selected mechanism:
   be redacted from application and reverse-proxy logs;
 - a production receiver MUST NOT be declared ready until the selected
   authentication mechanism is configured.
+
+Under the proposal, Gateway derives immutable `CorePrincipalID` only from an
+active verified credential registry record. It never accepts that value from a
+normal request header, URL or JSON body. The signature covers the method,
+canonical path, credential ID, `Idempotency-Key`, timestamp, nonce and SHA-256
+of the exact raw body bytes. A 60-second timestamp window plus an atomic
+five-minute shared nonce reservation provides authentication replay protection;
+normal Core retries keep `Idempotency-Key` but use a fresh timestamp, nonce and
+signature. Authentication, token-verifier and Payload Protection key domains
+remain strictly separate.
 
 ## Delivery identity and idempotency
 
@@ -311,8 +336,8 @@ destinations, verification codes, or event field values.
 | --- | --- |
 | `202 Accepted` | A new job is durably committed, or an identical delivery identity was already durably accepted |
 | `400 Bad Request` | Missing, empty, malformed, or repeated `Idempotency-Key`; malformed/ambiguous JSON; invalid field type or value; missing/extra field; duplicate JSON key; non-empty query string; or trailing data |
-| `401 Unauthorized` | Core authentication is missing or invalid |
-| `403 Forbidden` | The authenticated principal lacks intake authorization |
+| `401 Unauthorized` | Core authentication is missing or deterministically invalid, including an unknown/disabled/expired/revoked credential, invalid signature, invalid timestamp/nonce, or authentication replay |
+| `403 Forbidden` | A valid credential maps to a disabled principal or a principal without intake authorization |
 | `404 Not Found` | The authenticated request names an unknown or disabled opaque destination; response remains generic |
 | `405 Method Not Allowed` | Method is not `POST`; include `Allow: POST` |
 | `409 Conflict` | One stable delivery identity is reused with a different canonical payload |
@@ -359,15 +384,19 @@ implemented:
 The `Idempotency-Key: <outgoing_messages.id>` delivery-identity binding and
 the prohibition on no-ID sends are approved and are no longer decision items.
 
-1. **Core authentication mechanism.** Select mTLS identity, a signed request
-   scheme, a narrowly scoped bearer credential, or an approved combination.
-   The opaque destination token alone is explicitly insufficient.
+1. **Security Boundary V1 owner decision.** The linked decision proposal
+   uniquely selects HMAC-signed requests over verified TLS and a 256-bit opaque
+   token backed by a separate keyed HMAC verifier. Draft publication is not
+   approval. Project-owner merge after formal review approves those exact
+   choices; until then the opaque token remains insufficient authentication and
+   both mechanisms remain unimplemented.
 2. **Additional Core event types.** Confirm that `AlertBundle` and
    `ScheduleOnCallUsers` remain rejected for the Gateway MVP, or approve
    schemas and fixtures for them.
-3. **Opaque token lifecycle.** Define token generation entropy, storage,
-   rotation, revocation, and overlap behavior. No token format is selected by
-   this contract.
+3. **Implementation prerequisites after decision approval.** Select concrete
+   production secret sources and separately authorize the forward security
+   migration, Core signer, Gateway authenticator/resolver and final runtime
+   wiring. No implementation is authorized by merging documentation alone.
 
 The machine-readable `AlertState` field and its three case-sensitive values
 are owner-approved and are no longer a decision item. Until the remaining
