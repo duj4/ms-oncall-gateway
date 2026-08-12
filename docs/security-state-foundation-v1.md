@@ -1,13 +1,16 @@
 # Gateway Security State Foundation V1
 
-Status: In review. This checkpoint implements only the first implementation
-step authorized after the project-owner merge of Security Boundary V1 in
-Gateway PR #7, merge commit
-`9be58c84c705fe2d47a0d03437b6bd5634016c4e`.
+Status: Accepted by the project-owner merge of Gateway PR #8, merge commit
+`ea4673537b75074ce8a2d4de8aec56d4a4fccc42`.
 
-This checkpoint does not implement Authentication V1, token resolution,
-credential or token administration, Core signing, HTTP status mapping, or
-runtime wiring.
+This accepted checkpoint remains schema/domain-only. The strict Core
+Gateway-target matcher and HMAC signer foundation was separately accepted in
+Core PR #2, merge commit
+`d73e7a357f9d75a8b9c0aa7851107e860faed9d7`; production runtime still injects
+no real audience, credential or Authentication secret. Authentication V1 is a
+separate in-review foundation. Token rotation, Gateway repositories, token
+resolution, HTTP composition, production secret sources and runtime wiring
+remain unimplemented.
 
 ## Scope and evidence
 
@@ -257,10 +260,11 @@ authentication, destination resolution or durable HTTP acceptance.
 
 Separate project-owner authorization remains required to:
 
-1. implement the narrow Core Gateway-target signer and privileged token-only
-   Contact Method rotation operation;
-2. implement Gateway Authentication V1, the PostgreSQL registries and shared
-   replay reservation, and opaque-token resolution without runtime wiring;
+1. review and accept the transport-independent Gateway Authentication V1
+   foundation; the Core signer foundation is accepted but has no production
+   credential injection;
+2. implement the PostgreSQL registries and shared replay reservation, opaque
+   token resolution and the privileged Core token-only rotation operation;
 3. compose those adapters with the existing acceptance pipeline and test all
    HTTP failure and concurrency boundaries;
 4. choose and wire production secret sources; and

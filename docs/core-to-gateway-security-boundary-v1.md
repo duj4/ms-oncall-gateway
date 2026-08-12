@@ -4,10 +4,15 @@ Status: Approved as Security Boundary V1 by the project-owner merge of Gateway
 PR #7, merge commit `9be58c84c705fe2d47a0d03437b6bd5634016c4e`.
 
 The additive migration and domain-only seams in
-[Security State Foundation V1](security-state-foundation-v1.md) implement only
-the first separately authorized checkpoint. Authentication, resolution, Core
-signing and token rotation, HTTP composition, production secret sources and
-runtime wiring remain unimplemented and require separate owner authorization.
+[Security State Foundation V1](security-state-foundation-v1.md) were accepted
+in Gateway PR #8, merge commit
+`ea4673537b75074ce8a2d4de8aec56d4a4fccc42`. The strict Core target matcher and
+HMAC signer foundation was accepted in Core PR #2, merge commit
+`d73e7a357f9d75a8b9c0aa7851107e860faed9d7`, but production runtime injects no
+real audience, credential or secret. The transport-independent Gateway
+Authentication V1 foundation is in review. Resolution, token rotation,
+repositories, HTTP composition, production secret sources and runtime wiring
+remain unimplemented and require separate owner authorization.
 
 ## Scope and fixed architecture
 
@@ -68,12 +73,14 @@ key source, a worker, a provider or a callback.
   (`Store.Create` and `Store.Update`) persists the destination and does not
   permit it to be changed after creation.
 - `notification/webhook/sender.go` (`Sender.SendMessage`) reads the complete URL
-  from `webhook_url`, serializes the body, creates an HTTP `POST`, sets only
+  from `webhook_url`, serializes the body, creates an HTTP `POST`, sets
   `Content-Type` and `Idempotency-Key`, and applies a three-second request
-  timeout. It has no `Authorization`, request signature or client-certificate
-  behavior.
+  timeout. The separately accepted optional signer can add the exact three
+  Authentication V1 headers only for a strict Gateway target. Production
+  startup does not inject that signer or any real credential.
 - `app/app.go` (`NewApp`) creates one `http.Client` around the default transport.
-  `app/startup.go` passes that same client to the webhook sender; `app/inittwilio.go`,
+  `app/startup.go` passes that same client to the webhook sender through
+  `NewSender`, not `NewSenderWithGatewaySigner`; `app/inittwilio.go`,
   `app/initslack.go` and `app/initstores.go` also use it. All Webhook Contact
   Methods use the single registered webhook sender. Authentication material
   therefore must not be installed by mutating this shared client or sent to
@@ -109,9 +116,10 @@ key source, a worker, a provider or a callback.
 - Comparing the fork to pristine GoAlert v0.34.1 commit
   `0918387e38650aaddd6a923d445ee992f64d6ab6` shows fork changes only for stable
   delivery identity, machine-readable `AlertState`, transport correctness and
-  destination redaction in the relevant paths. The Webhook Contact Method
-  model, shared client construction and absence of Core authentication are
-  unchanged from pristine v0.34.1.
+  destination redaction plus the optional strict Gateway matcher/HMAC signer
+  foundation in the relevant paths. The Webhook Contact Method model and shared
+  client construction remain unchanged, and production runtime still supplies
+  no real Authentication credential.
 
 ## Security capabilities are distinct
 
@@ -299,13 +307,15 @@ closed without accepting a caller-supplied replacement.
 
 ### Minimum future code seams
 
-Core needs a Gateway-target-scoped signer injected into the webhook sender. It
-must match an exact configured HTTPS Gateway origin and canonical intake path,
-validate and sign its configured `GatewayAudienceID` with the already serialized
-body, add the three headers, and fail before `Client.Do` if configuration,
-randomness or signing fails. It must not mutate the shared `http.Client`, change
-JSON, change `Idempotency-Key`, change the three-second timeout or send the
-credential to non-Gateway webhook targets.
+Core now has an accepted optional Gateway-target-scoped signer seam in
+`NewSenderWithGatewaySigner`. It matches an exact configured HTTPS Gateway
+origin and canonical intake path, signs its configured `GatewayAudienceID` with
+the already serialized body, adds the three headers, and fails before
+`Client.Do` if configuration, randomness or signing fails. It does not mutate
+the shared `http.Client`, change JSON, change `Idempotency-Key`, change the
+three-second timeout or send the credential to non-Gateway webhook targets.
+Production startup intentionally continues to use `NewSender` without a real
+audience, credential or secret source.
 
 Core also needs the separate privileged Gateway-specific Contact Method
 token-rotation operation defined below. The normal `Store.Update` path remains
@@ -598,20 +608,19 @@ verifier-key IDs. Authentication and verifier secret material remains outside
 those tables. The migration and `internal/securitystate` interfaces implement
 no repository, HMAC, resolver, administration or runtime behavior.
 
-Recommended implementation order after separate owner authorization is:
+Implementation checkpoint status and remaining order are:
 
-1. **Current checkpoint:** add the forward security-state migration plus
-   domain-only audience, credential, principal, replay and destination resolver
-   interfaces and tests;
-2. implement the Core Gateway-target matcher, HMAC signer and privileged
-   token-only Contact Method rotation operation with exact-byte, clock, nonce,
-   queued/retry, rollback and redaction tests;
-3. implement Gateway Authentication V1, shared replay reservation and Opaque
-   Destination Token V1 resolution without runtime wiring;
-4. compose the verified adapter with the existing acceptance pipeline and add
-   full HTTP/concurrency/failure tests;
-5. wire production key sources and runtime only after the owner accepts all
-   prior checkpoints. Preserve `UnavailableSink/503` until then.
+1. the Security State Foundation migration and domain seams are accepted in
+   Gateway PR #8;
+2. the strict Core matcher/HMAC signer foundation is accepted in Core PR #2,
+   while privileged token rotation and production credential injection remain
+   unimplemented;
+3. the transport-independent Gateway Authentication V1 foundation is in review;
+4. PostgreSQL security-state repositories, shared replay persistence and Opaque
+   Destination Token V1 resolution still require separate owner authorization;
+5. HTTP composition, production secret sources and runtime wiring follow only
+   after prior checkpoints are accepted. Preserve `UnavailableSink/503` until
+   then.
 
 ## Required tests for future implementation
 
@@ -680,10 +689,10 @@ or authorize implementation of:
 4. support schemas and fixtures for `AlertBundle` or
    `ScheduleOnCallUsers`, which remain outside the MVP contract;
 5. authorization to configure and bind a unique audience per logical realm,
-   add the narrow privileged Core token-only rotation operation, change the Core
-   signer, implement the Gateway repositories and adapter, or replace
-   `UnavailableSink`. The migration/domain-only foundation does not authorize
-   any of those actions.
+   inject real Core signer credentials, add the narrow privileged Core
+   token-only rotation operation, implement the Gateway repositories and
+   adapter, or replace `UnavailableSink`. The accepted foundations do not
+   authorize any of those actions.
 
 Until each implementation checkpoint is separately approved, runtime remains
 unchanged and otherwise-valid requests continue to receive `503 Service
