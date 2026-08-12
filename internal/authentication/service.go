@@ -18,12 +18,13 @@ import (
 )
 
 const (
-	authenticationScheme       = "MSOnCall-HMAC-SHA256"
-	authorizationCredential    = " Credential="
-	authorizationSignature     = ", Signature="
-	canonicalPathPrefix        = "/v1/goalert/contact-method/"
-	canonicalSigningDomain     = "MS_ONCALL_GATEWAY_REQUEST_V1"
-	maximumTimestampDifference = uint64(60)
+	authenticationScheme        = "MSOnCall-HMAC-SHA256"
+	authorizationCredential     = " Credential="
+	authorizationSignature      = ", Signature="
+	canonicalPathPrefix         = "/v1/goalert/contact-method/"
+	canonicalSigningDomain      = "MS_ONCALL_GATEWAY_REQUEST_V1"
+	maximumTimestampDifference  = uint64(60)
+	maximumDependencyErrorDepth = 64
 )
 
 type Service struct {
@@ -124,11 +125,7 @@ func (service *Service) Authenticate(ctx context.Context, request Request) (Resu
 		return Result{}, ErrCanceled
 	}
 	if dependencyErr != nil {
-		if errors.Is(dependencyErr, securitystate.ErrInvalidState) ||
-			errors.Is(dependencyErr, securitystate.ErrAudienceMismatch) {
-			return Result{}, ErrUnavailable
-		}
-		if errors.Is(dependencyErr, securitystate.ErrCredentialNotFound) {
+		if singleCauseMatches(dependencyErr, securitystate.ErrCredentialNotFound) {
 			return Result{}, ErrAuthenticationFailed
 		}
 		return Result{}, ErrUnavailable
@@ -184,7 +181,7 @@ func (service *Service) Authenticate(ctx context.Context, request Request) (Resu
 		return Result{}, ErrCanceled
 	}
 	if dependencyErr != nil {
-		if errors.Is(dependencyErr, securitystate.ErrPrincipalNotAuthorized) {
+		if singleCauseMatches(dependencyErr, securitystate.ErrPrincipalNotAuthorized) {
 			return Result{}, ErrForbidden
 		}
 		return Result{}, ErrUnavailable
@@ -364,6 +361,22 @@ func contextDone(ctx context.Context) bool {
 
 func dependencyCanceled(ctx context.Context, dependencyErr error) bool {
 	return contextDone(ctx) || errors.Is(dependencyErr, context.Canceled) || errors.Is(dependencyErr, context.DeadlineExceeded)
+}
+
+func singleCauseMatches(err, target error) bool {
+	for current, depth := err, 0; current != nil && depth < maximumDependencyErrorDepth; depth++ {
+		if isNilInterface(current) {
+			return false
+		}
+		if _, ambiguous := current.(interface{ Unwrap() []error }); ambiguous {
+			return false
+		}
+		if reflect.TypeOf(current).Comparable() && current == target {
+			return true
+		}
+		current = errors.Unwrap(current)
+	}
+	return false
 }
 
 func isNilInterface(value any) bool {

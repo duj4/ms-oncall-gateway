@@ -90,6 +90,14 @@ func (*typedNilContext) Done() <-chan struct{}       { panic("typed-nil context 
 func (*typedNilContext) Err() error                  { panic("typed-nil context called") }
 func (*typedNilContext) Value(any) any               { panic("typed-nil context called") }
 
+type sentinelClaimingError struct {
+	target error
+}
+
+func (value sentinelClaimingError) Error() string { return testOnlyDependencyMarker }
+
+func (value sentinelClaimingError) Is(target error) bool { return target == value.target }
+
 type testFixture struct {
 	mutex              sync.Mutex
 	order              []string
@@ -591,6 +599,24 @@ func TestAudienceCredentialAndSecretBoundaries(t *testing.T) {
 		{name: "credential unknown wrapped", configure: func(_ *testing.T, fixture *testFixture) {
 			fixture.credentialErr = fmt.Errorf("%s: %w", testOnlyDependencyMarker, securitystate.ErrCredentialNotFound)
 		}, expected: ErrAuthenticationFailed, expectedOrder: []string{"clock", "audience", "credential"}},
+		{name: "credential unknown nested single wrappers", configure: func(_ *testing.T, fixture *testFixture) {
+			fixture.credentialErr = fmt.Errorf("outer: %w", fmt.Errorf("%s: %w", testOnlyDependencyMarker, securitystate.ErrCredentialNotFound))
+		}, expected: ErrAuthenticationFailed, expectedOrder: []string{"clock", "audience", "credential"}},
+		{name: "credential unknown joined with repository error", configure: func(_ *testing.T, fixture *testFixture) {
+			fixture.credentialErr = errors.Join(securitystate.ErrCredentialNotFound, errors.New(testOnlyDependencyMarker))
+		}, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential"}},
+		{name: "credential unknown outer wrapped join", configure: func(_ *testing.T, fixture *testFixture) {
+			fixture.credentialErr = fmt.Errorf("outer: %w", errors.Join(securitystate.ErrCredentialNotFound, errors.New(testOnlyDependencyMarker)))
+		}, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential"}},
+		{name: "credential unknown joined with same sentinel", configure: func(_ *testing.T, fixture *testFixture) {
+			fixture.credentialErr = errors.Join(securitystate.ErrCredentialNotFound, securitystate.ErrCredentialNotFound)
+		}, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential"}},
+		{name: "credential custom sentinel claim", configure: func(_ *testing.T, fixture *testFixture) {
+			fixture.credentialErr = sentinelClaimingError{target: securitystate.ErrCredentialNotFound}
+		}, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential"}},
+		{name: "credential cancellation has priority over joined causes", configure: func(_ *testing.T, fixture *testFixture) {
+			fixture.credentialErr = errors.Join(context.Canceled, securitystate.ErrCredentialNotFound, errors.New(testOnlyDependencyMarker))
+		}, expected: ErrCanceled, expectedOrder: []string{"clock", "audience", "credential"}},
 		{name: "credential invalid state", configure: func(_ *testing.T, fixture *testFixture) { fixture.credentialErr = securitystate.ErrInvalidState }, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential"}},
 		{name: "credential invalid state wrapped", configure: func(_ *testing.T, fixture *testFixture) {
 			fixture.credentialErr = fmt.Errorf("%s: %w", testOnlyDependencyMarker, securitystate.ErrInvalidState)
@@ -829,6 +855,24 @@ func TestReplayAndPrincipalBoundaries(t *testing.T) {
 		{name: "principal explicitly forbidden wrapped", configure: func(_ *testing.T, fixture *testFixture) {
 			fixture.principalErr = fmt.Errorf("%s: %w", testOnlyDependencyMarker, securitystate.ErrPrincipalNotAuthorized)
 		}, expected: ErrForbidden, expectedOrder: []string{"clock", "audience", "credential", "secret", "replay", "principal"}},
+		{name: "principal forbidden nested single wrappers", configure: func(_ *testing.T, fixture *testFixture) {
+			fixture.principalErr = fmt.Errorf("outer: %w", fmt.Errorf("%s: %w", testOnlyDependencyMarker, securitystate.ErrPrincipalNotAuthorized))
+		}, expected: ErrForbidden, expectedOrder: []string{"clock", "audience", "credential", "secret", "replay", "principal"}},
+		{name: "principal forbidden joined with repository error", configure: func(_ *testing.T, fixture *testFixture) {
+			fixture.principalErr = errors.Join(securitystate.ErrPrincipalNotAuthorized, errors.New(testOnlyDependencyMarker))
+		}, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential", "secret", "replay", "principal"}},
+		{name: "principal forbidden outer wrapped join", configure: func(_ *testing.T, fixture *testFixture) {
+			fixture.principalErr = fmt.Errorf("outer: %w", errors.Join(securitystate.ErrPrincipalNotAuthorized, errors.New(testOnlyDependencyMarker)))
+		}, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential", "secret", "replay", "principal"}},
+		{name: "principal forbidden joined with same sentinel", configure: func(_ *testing.T, fixture *testFixture) {
+			fixture.principalErr = errors.Join(securitystate.ErrPrincipalNotAuthorized, securitystate.ErrPrincipalNotAuthorized)
+		}, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential", "secret", "replay", "principal"}},
+		{name: "principal custom sentinel claim", configure: func(_ *testing.T, fixture *testFixture) {
+			fixture.principalErr = sentinelClaimingError{target: securitystate.ErrPrincipalNotAuthorized}
+		}, expected: ErrUnavailable, expectedOrder: []string{"clock", "audience", "credential", "secret", "replay", "principal"}},
+		{name: "principal cancellation has priority over joined causes", configure: func(_ *testing.T, fixture *testFixture) {
+			fixture.principalErr = errors.Join(context.DeadlineExceeded, securitystate.ErrPrincipalNotAuthorized, errors.New(testOnlyDependencyMarker))
+		}, expected: ErrCanceled, expectedOrder: []string{"clock", "audience", "credential", "secret", "replay", "principal"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

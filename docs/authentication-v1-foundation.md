@@ -108,7 +108,10 @@ lifecycle-unusable credential are authentication failures. A correctly bound
 principal that is disabled or lacks `gateway.intake.v1` is forbidden. In
 contrast, credential/principal repository failures, structurally invalid
 records, or records bound to an unexpected ID or audience are server-side
-integrity failures and fail closed as unavailable.
+integrity failures and fail closed as unavailable. A dependency error with any
+multi-cause unwrap node is ambiguous and also fails closed as unavailable, even
+if one cause is an otherwise caller-classifiable sentinel; cancellation retains
+priority over this classification.
 
 ## Safe errors
 
