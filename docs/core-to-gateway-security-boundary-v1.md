@@ -86,6 +86,24 @@ worker, a provider or a callback.
   Temporary attempts and persisted retries preserve the same
   `outgoing_messages.id`; `notification/webhook/sender.go` sends it as
   `Idempotency-Key`.
+- `user/contactmethod/store.go` (`Store.Update`) explicitly rejects any normal
+  update that changes `DestV1`; the generated update query changes only name,
+  disabled and status fields. Token rotation therefore cannot use the existing
+  Contact Method update path or pretend destination mutation is already
+  supported.
+- `engine/statusmgr/queries.sql` (`StatusMgrSendUserMsg`) and
+  `engine/verifymanager/db.go` (`DB.insertMessages`) enqueue a
+  `contact_method_id`, not a destination snapshot. `MessageMgrGetPending` in
+  `engine/message/queries.sql` and its generated `gadb/queries.sql.go` method
+  join that ID to the current
+  `user_contact_methods.dest`, and `engine/message.DB.currentQueue` loads that
+  current destination when a persisted message is selected.
+- `engine/message.DB.sendMessage` and `Message.Base` then copy the loaded
+  destination into one in-memory send cycle. Its immediate temporary retries
+  reuse that snapshot. A later durable retry is reset to pending and passes
+  through `currentQueue` again, so it reads the then-current Contact Method
+  destination. This split proves that token rotation needs a bounded old-token
+  overlap even after Core atomically changes the stored destination.
 - Comparing the fork to pristine GoAlert v0.34.1 commit
   `0918387e38650aaddd6a923d445ee992f64d6ab6` shows fork changes only for stable
   delivery identity, machine-readable `AlertState`, transport correctness and
@@ -128,7 +146,9 @@ conflict.
 | Body, URL, header or token reaches a log | Log only route templates, bounded result codes and non-sensitive counts; redact request targets and security material at every hop |
 | Core or Gateway clock is skewed | Permit only the defined signed-timestamp window and monitor clock synchronization; outside the window is authentication failure |
 | Gateway database leaks | Authentication secrets, raw destination tokens and token-verifier keys are absent; protected event data remains AES-GCM ciphertext |
-| One key is reused for another purpose | Reject deployment: authentication, replay hashing, token verification and payload protection use disjoint key domains |
+| Credential or token metadata is copied to another deployment realm | Bind request signatures and destination-token verifiers to the configured `GatewayAudienceID`; a different realm fails authentication or resolution |
+| Token rotation partially fails while sends continue | Permit only the two-token bounded state machine and the privileged Core compare-and-swap operation; fail closed on ambiguous state and never create a third usable token |
+| One key is reused for another purpose | Reject deployment: authentication, token verification and payload protection use exactly three disjoint key domains |
 
 ## Core authentication option matrix
 
@@ -149,15 +169,24 @@ remain mandatory and authoritative.
 
 ### Credentials and TLS
 
+- Each logical Gateway realm has one deployment-configured `GatewayAudienceID`.
+  It is a canonical lowercase hyphenated non-zero UUID. Development, QA, UAT
+  and production use different values; HA and DR instances for the same logical
+  realm use the same value.
+- `GatewayAudienceID` is local configuration on both signer and verifier. It is
+  never taken from an HTTP header, `Host`, `Forwarded`, the URL path or JSON.
+  Credential metadata and the destination-token registry are both bound to the
+  audience. Copying either record to another realm does not make it usable.
 - Every credential consists of a non-secret canonical lower-case UUIDv4
   `credential_id` and exactly 32 CSPRNG bytes of HMAC secret material.
 - Core obtains the pair from a dedicated external process secret source. It is
   not stored in a contact-method URL or destination argument and is not the
   Core data-encryption key.
 - Gateway stores credential metadata and its mapping to one immutable internal
-  `CorePrincipalID`. HMAC secret material is obtained by credential ID from a
-  dedicated external production secret source, never from the request or the
-  destination-token table.
+  `CorePrincipalID` and exactly one `GatewayAudienceID`. HMAC secret material is
+  obtained by credential ID from a dedicated external production secret source,
+  never from the request or the destination-token table. A credential whose
+  recorded audience differs from the verifier's local audience is unusable.
 - Selecting and implementing the concrete Core and Gateway production secret
   providers is a prerequisite to runtime implementation. This decision fixes
   the interfaces and security semantics, not a vendor such as Vault, KMS or an
@@ -192,6 +221,7 @@ trailing LF:
 
 ```text
 MS_ONCALL_GATEWAY_REQUEST_V1
+<canonical GatewayAudienceID UUID>
 POST
 /v1/goalert/contact-method/mso1_<token-body>
 <credential_id>
@@ -203,10 +233,13 @@ POST
 
 The canonical path contains only the literal ASCII prefix and canonical token;
 percent-encoded or otherwise equivalent spellings are invalid. The query string
-is empty. Gateway reconstructs these bytes from its validated transport values,
-looks up the active credential by ID, computes HMAC-SHA-256 and compares the
-32-byte MAC with `crypto/subtle.ConstantTimeCompare` semantics. It never signs
-decoded JSON or re-encoded body content.
+is empty. Core signs its configured audience and Gateway reconstructs the input
+with its own configured audience. Gateway requires that local audience to match
+the credential record, looks up the active credential by ID, computes
+HMAC-SHA-256 and compares the 32-byte MAC with
+`crypto/subtle.ConstantTimeCompare` semantics. It never signs decoded JSON or
+re-encoded body content. A missing, zero, non-canonical or wrong audience fails
+closed without accepting a caller-supplied replacement.
 
 ### Principal and authorization
 
@@ -232,10 +265,19 @@ decoded JSON or re-encoded body content.
 - Gateway accepts a signed timestamp only when it is within 60 seconds of its
   current time, inclusive.
 - After the signature is valid, Gateway atomically reserves the pair
-  `(credential_id, nonce)` in the shared logical read-write PostgreSQL database.
-  A uniqueness conflict is authentication replay and returns generic `401`.
-  Reservations are retained for five minutes, longer than the accepted clock
-  window. An unavailable or ambiguous reservation returns `503`.
+  `(credential_record_id, nonce_bytes)` in the shared logical read-write
+  PostgreSQL database. `nonce_bytes` is the strict decoded 16-byte nonce, not
+  its encoded spelling. A uniqueness conflict is authentication replay and
+  returns generic `401`. Reservations are retained for five minutes, longer
+  than the accepted clock window. An unavailable or ambiguous reservation
+  returns `503`.
+- The replay reservation has no independent cryptographic key, digest or key
+  rotation. Credential rotation does not rewrite, delete or change existing
+  nonce reservations; the internal credential record ID remains their stable
+  namespace until the five-minute retention period ends.
+- A nonce is public uniqueness input, not an authentication secret. It is still
+  sensitive correlation material and never enters a log, metric label, trace,
+  audit message or returned error.
 - The nonce store is shared by all Gateway instances and is not an in-memory
   cache. Clock synchronization and skew alerts are production prerequisites.
 - A normal Core retry keeps the same `Idempotency-Key` but generates a fresh
@@ -257,16 +299,23 @@ decoded JSON or re-encoded body content.
 
 Core needs a Gateway-target-scoped signer injected into the webhook sender. It
 must match an exact configured HTTPS Gateway origin and canonical intake path,
-sign the already serialized body, add the three headers, and fail before
-`Client.Do` if configuration, randomness or signing fails. It must not mutate
-the shared `http.Client`, change JSON, change `Idempotency-Key`, change the
-three-second timeout or send the credential to non-Gateway webhook targets.
+validate and sign its configured `GatewayAudienceID` with the already serialized
+body, add the three headers, and fail before `Client.Do` if configuration,
+randomness or signing fails. It must not mutate the shared `http.Client`, change
+JSON, change `Idempotency-Key`, change the three-second timeout or send the
+credential to non-Gateway webhook targets.
 
-Gateway needs narrow HTTP-adapter dependencies for credential lookup/signature
-verification, principal authorization, replay reservation and destination
-resolution. Only their verified `CorePrincipalID` and resolved `DestinationID`
-enter `intake.Request`. Domain, protection, durable and PostgreSQL repository
-interfaces remain free of HTTP headers and raw tokens.
+Core also needs the separate privileged Gateway-specific Contact Method
+token-rotation operation defined below. The normal `Store.Update` path remains
+destination-immutable. The operation is a narrow compare-and-swap of only the
+canonical token segment for an already identified Gateway `builtin-webhook`; it
+preserves the Contact Method UUID and every relationship keyed by that UUID.
+
+Gateway needs narrow HTTP-adapter dependencies for local audience validation,
+credential lookup/signature verification, principal authorization, replay
+reservation and destination resolution. Only their verified `CorePrincipalID`
+and resolved `DestinationID` enter `intake.Request`. Domain, protection, durable
+and PostgreSQL repository interfaces remain free of HTTP headers and raw tokens.
 
 ## Opaque destination-token option matrix
 
@@ -299,29 +348,42 @@ interfaces remain free of HTTP headers and raw tokens.
   ```text
   ASCII "MS_ONCALL_GATEWAY_DESTINATION_TOKEN_V1"
   0x00
+  canonical GatewayAudienceID ASCII bytes
+  0x00
   32 raw token bytes
   ```
 
 - The row stores the 32-byte verifier and its non-secret verifier-key ID.
+  Its metadata is bound to the same canonical `GatewayAudienceID` used to
+  calculate the verifier. A resolver uses only its local configured audience;
+  it never accepts an audience from the request.
   Lookup computes candidate verifiers for the bounded active/historical
   verifier keyring, performs indexed lookup by key ID and verifier, then
   confirms equality in constant time before returning the stable internal
   `DestinationID`.
 - Token-verifier key material and key IDs are in a different type, source and
-  namespace from Authentication V1 credentials, authentication replay hashing
-  and Payload Protection V1 AES keys. One value may never serve two purposes.
+  namespace from Authentication V1 credentials and Payload Protection V1 AES
+  keys. These are the only three cryptographic key domains in this decision;
+  one value may never serve two purposes.
 
 ### Lifecycle
 
 - A destination has one immutable Gateway-generated UUID `DestinationID` and an
   independent enabled/disabled state. Tokens never change that ID.
-- A token record is `active`, `retiring`, `revoked` or expired. Only active and
+- A token record is `staged`, `active`, `retiring`, `revoked` or expired. A
+  staged token has a persisted verifier but never resolves. Only active and
   unexpired retiring records resolve, and only when the destination is enabled.
 - Every token has a mandatory expiry no more than 90 days after creation. A
-  destination may have at most two usable tokens: one active and one retiring.
+  destination may have at most one staged token and two usable tokens: one
+  active and one retiring.
 - Rotation creates and displays a new token once, marks the prior token
   retiring, and caps overlap at 24 hours. A third usable token is rejected.
   Revocation is immediate and does not wait for overlap expiry.
+- A staged token gets an immutable cleanup deadline no later than 24 hours from
+  creation. Abort before activation revokes it; reaching the deadline expires
+  it. Creating another staged token is prohibited until the prior staged record
+  is confirmed revoked or expired. Losing its one-time raw value never makes it
+  resolvable and is recovered only by revoking or expiring that record.
 - New tokens use the active verifier key. Historical verifier keys remain
   available only until every associated token is expired or revoked. Because
   Gateway does not retain raw tokens, verifier-key rotation requires token
@@ -336,6 +398,88 @@ interfaces remain free of HTTP headers and raw tokens.
   read-write database on every resolution. Instance-local caches must not delay
   rotation, revocation or disablement.
 
+### Privileged Core token-rotation operation
+
+Normal `contactmethod.Store.Update` remains destination-immutable. Future token
+rotation requires one separate admin/system-only Core operation scoped solely to
+an identified `builtin-webhook` Contact Method already targeting Gateway. The
+operation preserves the Contact Method UUID, owner, notification rules,
+escalation references, disabled state and status-update setting. It may replace
+only the canonical `mso1_` token segment after both old and new destinations pass
+the strict Gateway-target matcher: exact HTTPS scheme, host, effective port and
+canonical `/v1/goalert/contact-method/{opaque_token}` route template, with empty
+userinfo, query and fragment. Every non-token URL component must be present in
+the same canonical form in both values; only the token segment may differ. It
+cannot add URL credentials, change origin, route, delivery identity or any other
+destination field. Tokens and complete URLs are never logged or returned in
+errors. The operation does not change `outgoing_messages.id` or any delivery
+identity. Gateway still never reads Core database tables.
+
+The future rotation coordinator must implement exactly this bounded sequence:
+
+1. Gateway creates one new `staged` token under the same destination, persists
+   its verifier and immutable cleanup deadline, and returns the raw token once
+   to the authorized coordinator. It does not resolve. No prior staged token or
+   retiring token may exist, and no third usable token may already exist.
+2. In one Gateway transaction, require that exact unexpired staged record and
+   one old active record, promote the new token to `active`, mark the old token
+   `retiring` and consume the staged state.
+3. As part of that same transaction, give the old token one overlap deadline no
+   later than 24 hours from the transaction's confirmed activation time. The
+   deadline is immutable and cannot be extended by retry or rollback. The staged
+   cleanup deadline does not reduce this post-activation drain interval. If the
+   transaction is confirmed not committed, the old token remains active and the
+   new token remains non-resolving until confirmed revocation or its staged
+   cleanup deadline.
+4. The coordinator validates both complete URLs in memory with the strict
+   matcher and retains the exact old value only in its bounded rotation context;
+   neither value enters logs, errors or audit fields. The privileged Core
+   operation then atomically compare-and-swaps the identified
+   Contact Method destination from the exact old canonical value to the exact
+   new canonical value. A mismatch or ambiguous commit fails closed; normal
+   `Store.Update` is not used.
+5. Core sends a newly signed verification request through that same Contact
+   Method. The request uses the unchanged persisted delivery-ID rules and the
+   new token; Gateway verifies the configured audience, signature and token.
+6. Until that verification succeeds, retain both old and new token records. An
+   already-loaded send cycle and its immediate retries may still use the old
+   snapshot; queued or later durable retries reload the current Core destination
+   and use the new token. After verification, allow the old token only for drain
+   of attempts already holding the old snapshot and revoke it as soon as drain
+   is confirmed.
+7. At the fixed overlap deadline Gateway expires the old token unconditionally.
+   Failure to prove drain cannot extend overlap or create another usable token.
+8. Rollback is exact and bounded. An abort before step 2 atomically revokes the
+   staged token and leaves the old token active. Before the overlap deadline, if
+   step 4 fails before the Core write is sent or Core proves no write occurred,
+   Gateway atomically revokes the new token and restores the old token to
+   `active`. If Core confirms the new value but step 5 fails, the coordinator
+   uses the same privileged compare-and-swap operation to restore the exact old
+   value, verifies the old signed path, then atomically revokes the new token and
+   restores the old token to `active`.
+9. Every create, activation and rollback transition enforces at most one staged
+   token and never more than one active plus one retiring token. A third usable
+   token is rejected rather than used for recovery.
+10. If the Gateway activation transaction, Core destination mutation or
+    rollback outcome is ambiguous, do not replay the mutation, revoke either
+    potentially referenced token, extend a deadline or create a third token.
+    Block further rotation, keep at most the existing old/new pair only until
+    the original deadline, return a fixed fail-closed result and require
+    privileged reconciliation. Reconciliation first inspects the authoritative
+    Gateway token states and deadlines, then reads the current Contact Method by
+    UUID; it accepts only the exact old or new canonical value and resumes the
+    matching branch above. Any other value is a hard failure. This is bounded
+    safety, not a claim of automatic recovery.
+
+The future Core test surface must cover queued messages, a send already loaded
+before rotation, immediate retry, later durable retry, concurrent send and
+rotation, staged tokens never resolving, interruption before activation,
+staged-token cleanup, atomic activation/retirement, old/new token overlap, Core
+update failure, verification failure, successful rollback, ambiguous rollback,
+expiry, revocation, and every partial failure boundary above, including
+immediate revoke before the deadline. No test may infer safety merely from
+updating a newly created Contact Method.
+
 ### Secrecy, backup and downstream boundaries
 
 - Raw tokens, full request paths and complete request targets are absent from
@@ -348,8 +492,10 @@ interfaces remain free of HTTP headers and raw tokens.
   of every affected token.
 - Backups contain token state and keyed verifiers, not raw tokens. HA/DR restore
   must restore matching external verifier-key versions before serving traffic;
-  a missing key fails closed. If raw tokens are lost at Core, Gateway cannot
-  recover them and new tokens must be issued.
+  a missing key fails closed. The restored realm must retain its original
+  `GatewayAudienceID`; restoring the records into a differently identified realm
+  does not make credentials or tokens usable. If raw tokens are lost at Core,
+  Gateway cannot recover them and new tokens must be issued.
 - Raw tokens remain in the HTTP adapter and resolver only. They never enter
   `intake.Request`, durable acceptance, protected event data, provider jobs or
   delivery identity. Gateway resolves a configured internal destination; it
@@ -371,9 +517,11 @@ precedes signature verification. The exact order is:
    raw bytes into a request-scoped buffer. Before authentication, do not decode
    JSON, resolve a destination, call intake or log body/header/path values.
 4. Parse the three authentication headers, validate their canonical syntax,
-   check credential metadata and secret availability, reconstruct the exact
-   signing input, verify HMAC in constant time, validate the timestamp and
-   atomically reserve the nonce. Deterministically invalid authentication is
+   validate the local configured `GatewayAudienceID`, require the credential
+   record's audience to match it, check secret availability, reconstruct the
+   exact signing input with that local audience, verify HMAC in constant time,
+   validate the timestamp and atomically reserve the strict decoded 16-byte
+   nonce by credential record ID. Deterministically invalid authentication is
    `401`; unavailable or ambiguous server-side dependencies are `503`.
 5. Derive `CorePrincipalID` from the verified credential record and require the
    enabled principal's `gateway.intake.v1` authorization. Failure is `403`.
@@ -403,6 +551,11 @@ not durable acceptance.
   destination state and token state use the same logical read-write PostgreSQL
   primary selection already required by the Gateway foundation. No stale
   standby or per-instance in-memory state may authorize a request.
+- All instances in one logical HA/DR realm use the same canonical
+  `GatewayAudienceID`. Development, QA, UAT, production and any restored clone
+  intended as a separate realm must use different IDs. Credential and token
+  metadata cannot be reused across those boundaries; backup/restore must not
+  silently change or duplicate the realm identity.
 - Authentication and token-resolution database failure returns `503` before
   intake. Primary failover starts a new top-level request; no authentication,
   nonce reservation or acceptance transaction is replayed internally.
@@ -410,9 +563,11 @@ not durable acceptance.
   and token-verifier key versions before shared metadata enables them. Missing
   key material fails closed. Database backup/restore and external secret-source
   recovery are one coordinated runbook.
-- Authentication HMAC secrets, authentication replay-hash keys, destination
-  token-verifier keys and Payload Protection AES keys use distinct random
-  material, access policies, rotation schedules, key IDs and audit scopes.
+- Authentication HMAC secrets, destination token-verifier keys and Payload
+  Protection AES keys use distinct random material, access policies, rotation
+  schedules, key IDs and audit scopes. Replay reservation uses only database
+  uniqueness over credential record ID and decoded nonce bytes and introduces
+  no fourth cryptographic key domain.
 
 ## Logging and observability
 
@@ -433,17 +588,19 @@ a metric label.
 ## Schema and implementation implications
 
 The published `000001_initial_schema.sql` remains immutable. A future forward
-migration is required before runtime wiring to hold, at minimum, principal and
-intake authorization state, credential metadata, replay reservations,
+migration is required before runtime wiring to hold, at minimum, the local realm
+audience binding, principal and intake authorization state, credential metadata,
+five-minute `(credential_record_id, nonce_bytes)` replay reservations,
 destinations, token lifecycle state, keyed verifiers and verifier-key IDs.
 Authentication and verifier secret material remains outside those tables.
 
 Recommended implementation order after separate owner authorization is:
 
-1. add the forward security-state migration plus domain-only credential,
-   principal, replay and destination resolver interfaces and tests;
-2. implement the Core Gateway-target matcher and HMAC signer with exact-byte,
-   clock, nonce, rotation and redaction tests;
+1. add the forward security-state migration plus domain-only audience,
+   credential, principal, replay and destination resolver interfaces and tests;
+2. implement the Core Gateway-target matcher, HMAC signer and privileged
+   token-only Contact Method rotation operation with exact-byte, clock, nonce,
+   queued/retry, rollback and redaction tests;
 3. implement Gateway Authentication V1, shared replay reservation and Opaque
    Destination Token V1 resolution without runtime wiring;
 4. compose the verified adapter with the existing acceptance pipeline and add
@@ -453,7 +610,8 @@ Recommended implementation order after separate owner authorization is:
 
 ## Required tests for future implementation
 
-- hard-coded HMAC signing vectors for the complete canonical request;
+- hard-coded HMAC signing vectors for the complete canonical request, including
+  the canonical `GatewayAudienceID` field;
 - header cardinality and syntax, exact raw-body binding and constant-time MAC
   comparison;
 - timestamp boundaries, clock skew, fresh nonces, replay uniqueness across two
@@ -461,11 +619,23 @@ Recommended implementation order after separate owner authorization is:
 - credential unknown/disabled/expired/revoked, principal disabled and
   intake-scope denial with exact `401`/`403` behavior;
 - secret-source and replay-store outage/ambiguity producing fail-closed `503`;
+- strict replay uniqueness by credential record ID and decoded 16-byte nonce,
+  including credential rotation with unchanged five-minute reservations and no
+  additional cryptographic key;
 - target-scoped Core signing proving non-Gateway webhooks receive no credential;
+- audience tests for correct, wrong, zero and non-canonical values, cross-realm
+  credential/token copies, same-realm HA/DR and restore under a different realm;
 - token format/entropy, one-time return, keyed verifier golden vectors,
   constant-time confirmation and raw-token absence from persistence;
-- token creation, two-token maximum, 24-hour overlap, expiry, immediate
-  revocation, destination disablement and generic `404` without an oracle;
+- token creation, one non-resolving staged-token maximum, staged abort/expiry,
+  atomic staged activation plus old-token retirement, two-usable-token maximum,
+  24-hour overlap, expiry, immediate revocation, destination disablement and
+  generic `404` without an oracle;
+- privileged Core token rotation covering queued and already-loaded messages,
+  immediate and durable retry, concurrent sends, exact old/new URL matching,
+  userinfo/query/fragment rejection, activation-relative overlap boundaries,
+  update and verification failure, confirmed and ambiguous rollback, overlap
+  expiry, revocation and every partial failure without a third usable token;
 - verifier-key rotation and historical lookup, missing-key fail closed,
   database backup/restore mismatch and multi-instance state consistency;
 - processing-order tests proving no JSON decode, resolution, intake or sensitive
@@ -486,7 +656,8 @@ Recommended implementation order after separate owner authorization is:
 - using in-memory nonce or revocation state in a multi-instance deployment;
 - storing raw destination tokens or using reversible token storage;
 - using a token, body hash, alert ID, timestamp or nonce as delivery identity;
-- reusing authentication, replay, token-verifier or payload-protection keys;
+- adding an unnecessary cryptographic key to database nonce uniqueness;
+- reusing authentication, token-verifier or payload-protection keys;
 - returning `202` before durable acceptance is confirmed.
 
 ## Remaining owner decisions
@@ -495,16 +666,18 @@ Merging this decision approves the protocol choices above, but does not select
 or authorize implementation of:
 
 1. the concrete production secret-source provider and operational custody for
-   Core HMAC secrets, Gateway HMAC secrets, replay hashing, token-verifier keys
-   and Payload Protection keys;
+   Core HMAC secrets, Gateway HMAC secrets, token-verifier keys and Payload
+   Protection keys;
 2. the administrative API/CLI and operator authorization used to create,
    rotate, revoke and audit principals, credentials, destinations and tokens;
 3. the deployment TLS termination topology and whether mTLS is additionally
    required as defense in depth;
 4. support schemas and fixtures for `AlertBundle` or
    `ScheduleOnCallUsers`, which remain outside the MVP contract;
-5. authorization to create the forward security-state migration, change Core,
-   implement the Gateway adapter or replace `UnavailableSink`.
+5. authorization to create the forward security-state migration, configure a
+   unique audience per logical realm, add the narrow privileged Core token-only
+   rotation operation, change the Core signer, implement the Gateway adapter or
+   replace `UnavailableSink`.
 
 Until each implementation checkpoint is separately approved, runtime remains
 unchanged and otherwise-valid requests continue to receive `503 Service

@@ -66,6 +66,25 @@ The security-boundary proposal gives the token the canonical form `mso1_`
 followed by unpadded base64url encoding of 32 CSPRNG bytes and stores only a
 separately keyed HMAC-SHA-256 verifier. That format and lifecycle become
 normative only if the project owner merges the decision PR after formal review.
+The verifier is also bound to the deployment-configured canonical
+`GatewayAudienceID`; the audience is never supplied by the request.
+
+The existing normal Core Contact Method update remains destination-immutable.
+The proposal requires a separate admin/system-only, Gateway-specific future
+operation for token rotation. It preserves the Contact Method UUID, owner,
+notification rules, escalation references, disabled/status-update state,
+origin and route, and atomically replaces only the canonical opaque token after
+strictly validating both old and new URLs. Userinfo, query and fragment are
+empty, and every non-token URL component must remain identical. The old token
+remains usable only in the fixed activation-relative overlap needed by sends
+that already loaded the old destination;
+queued and later durable retries reload the current Contact Method destination.
+The newly created token remains in a persisted non-resolving staged state until
+one transaction promotes it to active while marking the old token retiring; an
+abandoned staged token is revoked or expires at its fixed cleanup deadline.
+The exact bounded rotation and rollback sequence is normative in the linked
+security-boundary document. Neither operation nor token rotation is implemented
+by this contract update.
 
 Core v0.34.1 has a three-second webhook request timeout. Gateway intake MUST
 not wait for provider delivery. This timeout is a compatibility constraint,
@@ -211,13 +230,26 @@ Regardless of the selected mechanism:
 
 Under the proposal, Gateway derives immutable `CorePrincipalID` only from an
 active verified credential registry record. It never accepts that value from a
-normal request header, URL or JSON body. The signature covers the method,
-canonical path, credential ID, `Idempotency-Key`, timestamp, nonce and SHA-256
-of the exact raw body bytes. A 60-second timestamp window plus an atomic
-five-minute shared nonce reservation provides authentication replay protection;
-normal Core retries keep `Idempotency-Key` but use a fresh timestamp, nonce and
-signature. Authentication, token-verifier and Payload Protection key domains
-remain strictly separate.
+normal request header, URL or JSON body. Both Core and Gateway use the same
+locally configured canonical lowercase hyphenated non-zero UUID
+`GatewayAudienceID`; Dev, QA, UAT and production have different values, while
+HA/DR instances in one logical realm share one value. The audience is not
+derived from a header, `Host`, `Forwarded`, path or JSON. Credential metadata
+and token-verifier records are bound to it, so records copied to another realm
+fail closed.
+
+The signature covers, in order, the fixed domain line, canonical audience,
+method, canonical path, credential ID, `Idempotency-Key`, timestamp, nonce and
+lowercase SHA-256 of the exact raw body bytes. A 60-second timestamp window plus
+an atomic five-minute shared uniqueness reservation over
+`(credential_record_id, nonce_bytes)` provides authentication replay protection;
+`nonce_bytes` is the strict decoded 16-byte value. A uniqueness conflict is
+generic `401`, while unavailable or ambiguous reservation is `503`. This
+reservation has no digest, independent cryptographic key or key rotation, and
+credential rotation does not alter existing reservations. Normal Core retries
+keep `Idempotency-Key` but use a fresh timestamp, nonce and signature.
+Authentication, token-verifier and Payload Protection are the only three key
+domains and remain strictly separate.
 
 ## Delivery identity and idempotency
 
@@ -395,8 +427,10 @@ the prohibition on no-ID sends are approved and are no longer decision items.
    schemas and fixtures for them.
 3. **Implementation prerequisites after decision approval.** Select concrete
    production secret sources and separately authorize the forward security
-   migration, Core signer, Gateway authenticator/resolver and final runtime
-   wiring. No implementation is authorized by merging documentation alone.
+   migration, unique deployment audience, Core signer, narrow privileged
+   Gateway-token rotation operation, Gateway authenticator/resolver and final
+   runtime wiring. No implementation is authorized by merging documentation
+   alone.
 
 The machine-readable `AlertState` field and its three case-sensitive values
 are owner-approved and are no longer a decision item. Until the remaining
