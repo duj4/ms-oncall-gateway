@@ -145,11 +145,13 @@ and ambiguous multi-cause dependency errors fail closed as unavailable.
 PostgreSQL Authentication State Repositories V1 was accepted by the
 project-owner merge of Gateway PR #10, merge commit
 `1e22c4058350dc4889235772017547082bb01556`. It supplies database-backed
-audience, credential, principal and replay dependencies only. The separately
-authorized Opaque Destination Token Resolver V1 checkpoint is in review.
+audience, credential, principal and replay dependencies only. Opaque
+Destination Token Resolver V1 was separately accepted in Gateway PR #11,
+merge commit `cbd5164db2f99c4cc856836288be22afb88bd440`. Destination Token
+Lifecycle Transaction Foundation V1 is in review.
 
 This accepted Authentication checkpoint still does not implement an HTTP
 adapter or status mapping, production secret provider, credential or token
-administration, rotation, runtime composition or wiring. Gateway runtime
-remains `UnavailableSink`; otherwise-valid webhooks still receive
-`503 Service Unavailable`.
+administration, Core token mutation, cross-repository rotation coordination,
+runtime composition or wiring. Gateway runtime remains `UnavailableSink`;
+otherwise-valid webhooks still receive `503 Service Unavailable`.

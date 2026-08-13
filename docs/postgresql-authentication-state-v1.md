@@ -75,14 +75,17 @@ database/mTLS/read-write guard, and owns and cleans only fixed test records. It
 does not validate failover. The HA/DR integration test retains a separate opt-in
 environment and skip reason.
 
-The separately authorized Opaque Destination Token Resolver V1 checkpoint is
-in review. It reuses this repository foundation's single logical read-write
-pool and the accepted destination/token tables, but does not modify these four
-Authentication State repository interfaces or their error classifications.
+Opaque Destination Token Resolver V1 was separately accepted in Gateway PR
+#11, merge commit `cbd5164db2f99c4cc856836288be22afb88bd440`. It reuses this
+repository foundation's single logical read-write pool and the accepted
+destination/token tables, but does not modify these four Authentication State
+repository interfaces or their error classifications. Destination Token
+Lifecycle Transaction Foundation V1 is in review over the same published
+schema.
 
-Token creation and rotation, the privileged Core token-only operation,
-production Authentication and verifier-key sources, HTTP authentication and
-resolution composition, status mapping, replay cleanup, runtime wiring and
-`202 Accepted` remain unimplemented. Runtime remains deliberately wired to
-`UnavailableSink`, and otherwise-valid webhooks continue to receive
-`503 Service Unavailable`.
+The privileged Core token-only operation, cross-repository rotation
+coordination, production Authentication and verifier-key sources, HTTP
+authentication and resolution composition, status mapping, replay cleanup,
+runtime wiring and `202 Accepted` remain unimplemented. Runtime remains
+deliberately wired to `UnavailableSink`, and otherwise-valid webhooks continue
+to receive `503 Service Unavailable`.

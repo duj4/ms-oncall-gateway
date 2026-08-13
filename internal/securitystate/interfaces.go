@@ -39,3 +39,27 @@ type DestinationResolver interface {
 type DestinationVerifierKeySource interface {
 	DestinationVerifierKey(context.Context, GatewayAudienceID, DestinationVerifierKeyID) (DestinationVerifierKey, error)
 }
+
+type DestinationTokenRecordIDGenerator interface {
+	NewDestinationTokenRecordID(context.Context) (DestinationTokenRecordID, error)
+}
+
+type DestinationTokenLifecycleRepository interface {
+	CreateStagedToken(context.Context, StagedTokenCandidate, time.Time) error
+	ActivateInitialToken(context.Context, GatewayAudienceID, DestinationID, DestinationTokenRecordID, time.Time) error
+	ActivateRotation(context.Context, ActivateRotationCommand) error
+	AbortStagedToken(context.Context, GatewayAudienceID, DestinationID, DestinationTokenRecordID, time.Time) error
+	RollbackRotation(context.Context, RollbackRotationCommand) error
+	FinalizeRotation(context.Context, FinalizeRotationCommand) error
+	InspectLifecycleState(context.Context, GatewayAudienceID, DestinationID, time.Time) (DestinationLifecycleSnapshot, error)
+}
+
+type DestinationTokenLifecycle interface {
+	CreateStagedToken(context.Context, GatewayAudienceID, DestinationID) (CreatedStagedToken, error)
+	ActivateInitialToken(context.Context, GatewayAudienceID, DestinationID, DestinationTokenRecordID) error
+	ActivateRotation(context.Context, GatewayAudienceID, DestinationID, DestinationTokenRecordID, DestinationTokenRecordID) error
+	AbortStagedToken(context.Context, GatewayAudienceID, DestinationID, DestinationTokenRecordID) error
+	RollbackRotation(context.Context, GatewayAudienceID, DestinationID, DestinationTokenRecordID, DestinationTokenRecordID) error
+	FinalizeRotation(context.Context, GatewayAudienceID, DestinationID, DestinationTokenRecordID, DestinationTokenRecordID, RotationCompletionReason) error
+	InspectLifecycleState(context.Context, GatewayAudienceID, DestinationID) (DestinationLifecycleSnapshot, error)
+}

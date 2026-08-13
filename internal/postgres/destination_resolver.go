@@ -2,7 +2,6 @@ package postgres
 
 import (
 	"context"
-	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
 	"fmt"
@@ -13,8 +12,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
-
-const destinationTokenVerifierDomain = "MS_ONCALL_GATEWAY_DESTINATION_TOKEN_V1"
 
 const selectDestinationTokenSQL = `
 	select
@@ -266,7 +263,7 @@ func (resolver *OpaqueDestinationResolver) verifierCandidates(
 			unavailable = true
 			continue
 		}
-		verifier, verifierErr := computeDestinationTokenVerifier(audience, rawToken, keyBytes)
+		verifier, verifierErr := securitystate.ComputeDestinationTokenVerifier(audience, rawToken, key)
 		if verifierErr != nil {
 			unavailable = true
 			continue
@@ -279,22 +276,19 @@ func (resolver *OpaqueDestinationResolver) verifierCandidates(
 	return candidates, nil
 }
 
+// computeDestinationTokenVerifier remains as the package-local test seam used
+// by the accepted Resolver V1 golden vector. The algorithm lives only in the
+// securitystate package so resolver and lifecycle creation cannot drift.
 func computeDestinationTokenVerifier(
 	audience securitystate.GatewayAudienceID,
 	rawToken securitystate.OpaqueDestinationToken,
-	key []byte,
+	keyBytes []byte,
 ) (securitystate.TokenVerifier, error) {
-	if audience.IsZero() || len(key) < sha256.Size {
+	key, err := securitystate.NewDestinationVerifierKey(keyBytes)
+	if err != nil {
 		return securitystate.TokenVerifier{}, ErrDestinationResolverIntegrity
 	}
-	mac := hmac.New(sha256.New, key)
-	_, _ = mac.Write([]byte(destinationTokenVerifierDomain))
-	_, _ = mac.Write([]byte{0})
-	_, _ = mac.Write([]byte(audience.String()))
-	_, _ = mac.Write([]byte{0})
-	tokenBytes := rawToken.Bytes()
-	_, _ = mac.Write(tokenBytes[:])
-	return securitystate.NewTokenVerifier(mac.Sum(nil))
+	return securitystate.ComputeDestinationTokenVerifier(audience, rawToken, key)
 }
 
 type destinationTokenRecord struct {
