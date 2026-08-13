@@ -142,10 +142,14 @@ The two formal owner-review findings were repaired before merge: repository
 integrity failures cannot become caller authentication/authorization failures,
 and ambiguous multi-cause dependency errors fail closed as unavailable.
 
-The in-review PostgreSQL Authentication State Repositories V1 checkpoint
-supplies database-backed audience, credential, principal and replay dependencies
-only. This accepted Authentication checkpoint still does not
-implement an HTTP adapter or status mapping, opaque-token resolver, production
-secret provider, credential or token administration, rotation, runtime
-composition or wiring. Gateway runtime remains `UnavailableSink`;
-otherwise-valid webhooks still receive `503 Service Unavailable`.
+PostgreSQL Authentication State Repositories V1 was accepted by the
+project-owner merge of Gateway PR #10, merge commit
+`1e22c4058350dc4889235772017547082bb01556`. It supplies database-backed
+audience, credential, principal and replay dependencies only. The separately
+authorized Opaque Destination Token Resolver V1 checkpoint is in review.
+
+This accepted Authentication checkpoint still does not implement an HTTP
+adapter or status mapping, production secret provider, credential or token
+administration, rotation, runtime composition or wiring. Gateway runtime
+remains `UnavailableSink`; otherwise-valid webhooks still receive
+`503 Service Unavailable`.
