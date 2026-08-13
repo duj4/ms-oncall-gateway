@@ -12,9 +12,12 @@ HMAC signer foundation was accepted in Core PR #2, merge commit
 real audience, credential or secret. The transport-independent Gateway
 Authentication V1 foundation was accepted in Gateway PR #9, merge commit
 `4e74094fd89273b7132bad49f734ad222feb1a8a`. PostgreSQL audience, credential,
-principal and replay repositories are a separate in-review checkpoint.
-Resolution, token rotation, HTTP composition, production secret sources and
-runtime wiring remain unimplemented and require separate owner authorization.
+principal and replay repositories were accepted by the project-owner merge of
+Gateway PR #10, merge commit
+`1e22c4058350dc4889235772017547082bb01556`. Opaque Destination Token Resolver
+V1 is a separate in-review checkpoint. Token creation and rotation, HTTP
+composition, production secret sources and runtime wiring remain unimplemented
+and require separate owner authorization.
 
 ## Scope and fixed architecture
 
@@ -620,9 +623,13 @@ Implementation checkpoint status and remaining order are:
 3. the transport-independent Gateway Authentication V1 foundation is accepted
    in Gateway PR #9;
 4. PostgreSQL audience, credential, principal and shared replay repositories
-   are in review, while Opaque Destination Token V1 resolution still requires
-   separate owner authorization;
-5. HTTP composition, production secret sources and runtime wiring follow only
+   are accepted in Gateway PR #10;
+5. Opaque Destination Token Resolver V1 is in review. It computes the fixed
+   domain-separated verifier across a bounded configured keyring, performs
+   indexed PostgreSQL lookup and returns only a stable `DestinationID`;
+6. token creation, rotation, rollback, reconciliation and the privileged Core
+   token-only operation remain separate future checkpoints;
+7. HTTP composition, production secret sources and runtime wiring follow only
    after prior checkpoints are accepted. Preserve `UnavailableSink/503` until
    then.
 
@@ -693,10 +700,10 @@ or authorize implementation of:
 4. support schemas and fixtures for `AlertBundle` or
    `ScheduleOnCallUsers`, which remain outside the MVP contract;
 5. authorization to configure and bind a unique audience per logical realm,
-   inject real Core signer credentials, add the narrow privileged Core
-   token-only rotation operation, implement the Gateway repositories and
-   adapter, or replace `UnavailableSink`. The accepted foundations do not
-   authorize any of those actions.
+   inject real Core signer credentials or verifier keys, add the narrow
+   privileged Core token-only rotation operation, compose the accepted
+   repositories and resolver with HTTP, or replace `UnavailableSink`. The
+   accepted foundations do not authorize any of those actions.
 
 Until each implementation checkpoint is separately approved, runtime remains
 unchanged and otherwise-valid requests continue to receive `503 Service

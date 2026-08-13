@@ -276,7 +276,9 @@ workers, providers, and HTTP wiring remain unimplemented.
 
 ## Authentication state repositories
 
-PostgreSQL Authentication State Repositories V1 implements only the accepted
+PostgreSQL Authentication State Repositories V1 was accepted by the
+project-owner merge of Gateway PR #10, merge commit
+`1e22c4058350dc4889235772017547082bb01556`. It implements only the accepted
 security-state interfaces for realm binding, credential lookup, principal
 lookup and shared replay reservation. Every read uses the existing single
 logical read-write pool and reconstructs domain values through their public
@@ -304,7 +306,27 @@ tests use fakes and no database.
 The single-instance PostgreSQL integration test is separately opt-in and is not
 HA/DR evidence; the multi-instance HA/DR test retains its independent switch.
 
-This repository checkpoint does not implement Authentication secrets,
-destination resolution, credential/token rotation, HTTP composition or runtime
-wiring. The running binary continues to use `UnavailableSink`, so otherwise
-valid webhook requests remain `503 Service Unavailable`.
+## Opaque destination-token resolution
+
+Opaque Destination Token Resolver V1 is in review. For each request it obtains
+all one or two explicitly configured verifier keys, computes the fixed
+domain-separated HMAC-SHA-256 candidates in memory, and performs one bounded
+parameterized indexed lookup per candidate. SQL receives only the local
+audience, configured key ID and computed verifier, never the raw token.
+
+The token query starts from `gateway_destination_tokens` and left joins
+`gateway_destinations`. The resolver reconstructs both rows through public
+security-state constructors, confirms every audience, ID, key-ID and verifier
+relationship, compares verifiers in constant time and applies the caller's one
+clock snapshot. Confirmed absence and every unusable lifecycle state share
+`ErrDestinationNotFound`. Missing keys, malformed or cross-bound rows, multiple
+matches and repository uncertainty fail closed as fixed server-side errors.
+Interrupted connections are destroyed; confirmed ordinary read failures release
+the connection. There is no cache, retry, replay, compensation query, log,
+metric or trace.
+
+This repository and resolver scope does not implement Authentication secrets,
+token creation or rotation, privileged Core mutation, production verifier-key
+sources, HTTP composition or runtime wiring. The running binary continues to
+use `UnavailableSink`, so otherwise-valid webhook requests remain
+`503 Service Unavailable`; `202 Accepted` remains prohibited.

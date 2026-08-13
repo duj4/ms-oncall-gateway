@@ -10,9 +10,11 @@ Core PR #2, merge commit
 no real audience, credential or Authentication secret. Authentication V1 was
 accepted in Gateway PR #9, merge commit
 `4e74094fd89273b7132bad49f734ad222feb1a8a`. PostgreSQL audience, credential,
-principal and replay repositories are a separate in-review checkpoint. Token
-rotation, destination-token resolution, HTTP composition, production secret
-sources and runtime wiring remain unimplemented.
+principal and replay repositories were accepted by the project-owner merge of
+Gateway PR #10, merge commit
+`1e22c4058350dc4889235772017547082bb01556`. Opaque Destination Token Resolver
+V1 is a separate in-review checkpoint. Token creation and rotation, HTTP
+composition, production secret sources and runtime wiring remain unimplemented.
 
 ## Scope and evidence
 
@@ -262,12 +264,12 @@ authentication, destination resolution or durable HTTP acceptance.
 
 Separate project-owner authorization remains required to:
 
-1. review the separately implemented PostgreSQL audience, credential,
-   principal and shared replay repositories; Authentication V1 and the Core
-   signer foundation are accepted but have no production credential injection;
-2. implement opaque-token resolution and the privileged Core token-only
-   rotation operation;
-3. compose those adapters with the existing acceptance pipeline and test all
-   HTTP failure and concurrency boundaries;
+1. review the separately implemented Opaque Destination Token Resolver V1;
+   Authentication V1, its PostgreSQL repositories and the Core signer
+   foundation are accepted, but have no production credential or key injection;
+2. implement token creation, rotation, rollback and reconciliation together
+   with the privileged Core token-only operation;
+3. compose Authentication and resolution with the existing acceptance pipeline
+   and test all HTTP failure and concurrency boundaries;
 4. choose and wire production secret sources; and
 5. replace `UnavailableSink` only after every prerequisite is accepted.

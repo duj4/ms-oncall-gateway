@@ -25,6 +25,8 @@ var (
 	ErrSchemaInvalid                  = errors.New("database schema is invalid")
 	ErrAuthenticationStateUnavailable = errors.New("database authentication state unavailable")
 	ErrAuthenticationStateIntegrity   = errors.New("database authentication state invalid")
+	ErrDestinationResolverUnavailable = errors.New("database destination resolver unavailable")
+	ErrDestinationResolverIntegrity   = errors.New("database destination resolver state invalid")
 )
 
 // SafeError deliberately retains only bounded, non-sensitive diagnostic data.
