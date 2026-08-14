@@ -13,8 +13,11 @@ accepted in Gateway PR #9, merge commit
 principal and replay repositories were accepted by the project-owner merge of
 Gateway PR #10, merge commit
 `1e22c4058350dc4889235772017547082bb01556`. Opaque Destination Token Resolver
-V1 is a separate in-review checkpoint. Token creation and rotation, HTTP
-composition, production secret sources and runtime wiring remain unimplemented.
+V1 was accepted in Gateway PR #11, merge commit
+`cbd5164db2f99c4cc856836288be22afb88bd440`. Destination Token Lifecycle
+Transaction Foundation V1 is a separate in-review checkpoint. Core token-only
+URL mutation, rotation coordination, HTTP composition, production secret
+sources and runtime wiring remain unimplemented.
 
 ## Scope and evidence
 
@@ -264,12 +267,15 @@ authentication, destination resolution or durable HTTP acceptance.
 
 Separate project-owner authorization remains required to:
 
-1. review the separately implemented Opaque Destination Token Resolver V1;
-   Authentication V1, its PostgreSQL repositories and the Core signer
-   foundation are accepted, but have no production credential or key injection;
-2. implement token creation, rotation, rollback and reconciliation together
-   with the privileged Core token-only operation;
-3. compose Authentication and resolution with the existing acceptance pipeline
+1. review the separately implemented Destination Token Lifecycle Transaction
+   Foundation V1; Authentication V1, its PostgreSQL repositories, the opaque
+   resolver and the Core signer foundation are accepted, but have no production
+   credential or key injection;
+2. implement the planned Core Gateway token-only URL compare-and-swap operation
+   after the lifecycle foundation is accepted and merged;
+3. implement the cross-repository rotation coordinator, including privileged
+   reconciliation;
+4. compose Authentication and resolution with the existing acceptance pipeline
    and test all HTTP failure and concurrency boundaries;
-4. choose and wire production secret sources; and
-5. replace `UnavailableSink` only after every prerequisite is accepted.
+5. choose and wire production secret sources; and
+6. replace `UnavailableSink` only after every prerequisite is accepted.

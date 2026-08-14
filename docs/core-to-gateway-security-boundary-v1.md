@@ -15,9 +15,12 @@ Authentication V1 foundation was accepted in Gateway PR #9, merge commit
 principal and replay repositories were accepted by the project-owner merge of
 Gateway PR #10, merge commit
 `1e22c4058350dc4889235772017547082bb01556`. Opaque Destination Token Resolver
-V1 is a separate in-review checkpoint. Token creation and rotation, HTTP
-composition, production secret sources and runtime wiring remain unimplemented
-and require separate owner authorization.
+V1 was accepted in Gateway PR #11, merge commit
+`cbd5164db2f99c4cc856836288be22afb88bd440`. Destination Token Lifecycle
+Transaction Foundation V1 is a separate in-review checkpoint. Core token-only
+URL mutation, cross-repository rotation coordination, HTTP composition,
+production secret sources and runtime wiring remain unimplemented and require
+separate owner authorization.
 
 ## Scope and fixed architecture
 
@@ -444,7 +447,11 @@ The future rotation coordinator must implement exactly this bounded sequence:
 3. As part of that same transaction, give the old token one overlap deadline no
    later than 24 hours from the transaction's confirmed activation time. The
    deadline is immutable and cannot be extended by retry or rollback. The staged
-   cleanup deadline does not reduce this post-activation drain interval. If the
+   cleanup deadline does not reduce this post-activation drain interval. Token
+   lifetime begins at staged-token creation, so both the new staged token and
+   old active token must expire strictly after the complete overlap deadline;
+   equality is insufficient. Activation fails as a precondition conflict before
+   mutation rather than shortening or recalculating the deadline. If the
    transaction is confirmed not committed, the old token remains active and the
    new token remains non-resolving until confirmed revocation or its staged
    cleanup deadline.
@@ -624,12 +631,18 @@ Implementation checkpoint status and remaining order are:
    in Gateway PR #9;
 4. PostgreSQL audience, credential, principal and shared replay repositories
    are accepted in Gateway PR #10;
-5. Opaque Destination Token Resolver V1 is in review. It computes the fixed
+5. Opaque Destination Token Resolver V1 is accepted in Gateway PR #11. It
+   computes the fixed
    domain-separated verifier across a bounded configured keyring, performs
    indexed PostgreSQL lookup and returns only a stable `DestinationID`;
-6. token creation, rotation, rollback, reconciliation and the privileged Core
-   token-only operation remain separate future checkpoints;
-7. HTTP composition, production secret sources and runtime wiring follow only
+6. Destination Token Lifecycle Transaction Foundation V1 is in review. It
+   implements the seven transport-independent transaction and inspection
+   primitives, but not Core mutation or cross-repository coordination;
+7. Core Gateway Destination Token-only URL CAS V1 is the planned next
+   checkpoint after owner acceptance and merge of the lifecycle foundation; it
+   is not authorized by recording it here;
+8. rotation coordination, HTTP composition, production secret sources and
+   runtime wiring follow only
    after prior checkpoints are accepted. Preserve `UnavailableSink/503` until
    then.
 

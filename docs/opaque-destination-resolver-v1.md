@@ -1,6 +1,7 @@
 # Gateway Opaque Destination Token Resolver V1
 
-Status: In review
+Status: Accepted by the project-owner merge of Gateway PR #11, merge commit
+`cbd5164db2f99c4cc856836288be22afb88bd440`.
 
 This checkpoint implements the existing transport-independent
 `securitystate.DestinationResolver` over the accepted Security State V1 schema.
@@ -102,9 +103,13 @@ and owns and removes only its fixed test realm, destination and token rows in
 dependency order. When disabled it uses the repository's existing exact skip
 reason. It is not HA/DR, failover, fencing, RPO or RTO evidence.
 
-This checkpoint does not implement token creation, one-time return, activation,
-rotation, rollback, reconciliation or privileged Core mutation. It also adds no
-production key source, HTTP authentication/resolution composition, status
-mapping, runtime wiring, replay cleanup, provider work or `202 Accepted`.
-Gateway runtime remains deliberately wired to `UnavailableSink`; otherwise-valid
-webhooks continue to receive `503 Service Unavailable`.
+The separately authorized Destination Token Lifecycle Transaction Foundation V1
+checkpoint is in review. It adds transaction-scoped creation and lifecycle
+primitives but does not change this resolver's read behavior.
+
+The accepted resolver does not implement the privileged Core mutation, the
+cross-repository rotation coordinator, a production key source, HTTP
+authentication/resolution composition, status mapping, runtime wiring, replay
+cleanup, provider work or `202 Accepted`. Gateway runtime remains deliberately
+wired to `UnavailableSink`; otherwise-valid webhooks continue to receive
+`503 Service Unavailable`.
