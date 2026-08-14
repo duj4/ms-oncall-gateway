@@ -437,6 +437,9 @@ func (repository *DestinationTokenLifecycleRepository) ActivateRotation(
 			staged.RecordID() != stagedID || active.RecordID() != oldActiveID {
 			return securitystate.ErrDestinationLifecycleConflict
 		}
+		if !overlapDeadline.Before(staged.ExpiresAt()) || !overlapDeadline.Before(active.ExpiresAt()) {
+			return securitystate.ErrDestinationLifecycleConflict
+		}
 
 		// Retire the old row first so the existing partial active-token index
 		// permits the staged row to become active in the same transaction.

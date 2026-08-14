@@ -335,7 +335,8 @@ func NewDestinationTokenLifecycleService(config DestinationTokenLifecycleConfig)
 		nilLifecycleDependency(config.VerifierKeys) || config.ActiveVerifierKeyID.IsZero() ||
 		config.TokenLifetime <= 0 || config.TokenLifetime > MaximumDestinationTokenLifetime ||
 		config.StagedCleanupDuration <= 0 || config.StagedCleanupDuration > MaximumStagedCleanupDuration ||
-		config.RetiringOverlap <= 0 || config.RetiringOverlap > MaximumRetiringOverlapDuration {
+		config.RetiringOverlap <= 0 || config.RetiringOverlap > MaximumRetiringOverlapDuration ||
+		config.TokenLifetime <= config.RetiringOverlap {
 		return nil, ErrDestinationLifecycleInvalid
 	}
 	parsedKeyID, err := NewDestinationVerifierKeyID(config.ActiveVerifierKeyID.Value())

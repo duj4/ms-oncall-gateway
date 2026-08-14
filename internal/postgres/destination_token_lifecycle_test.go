@@ -433,6 +433,65 @@ func TestDestinationTokenLifecycleTransitionSQLAndDeadlineBoundaries(t *testing.
 	}
 }
 
+func TestDestinationTokenLifecycleRotationRequiresFullOverlapCoverage(t *testing.T) {
+	audience := lifecyclePGAudience(t)
+	destination := lifecyclePGDestination(t)
+	oldActive := lifecyclePGRecord(t, lifecyclePGTestRecordOne)
+	staged := lifecyclePGRecord(t, lifecyclePGTestRecordTwo)
+	overlapDeadline := lifecyclePGNow.Add(6 * time.Hour)
+	covered := overlapDeadline.Add(time.Nanosecond)
+
+	for _, test := range []struct {
+		name         string
+		stagedExpiry time.Time
+		activeExpiry time.Time
+		wantConflict bool
+	}{
+		{name: "staged expires before deadline", stagedExpiry: overlapDeadline.Add(-time.Nanosecond), activeExpiry: covered, wantConflict: true},
+		{name: "staged expires at deadline", stagedExpiry: overlapDeadline, activeExpiry: covered, wantConflict: true},
+		{name: "active expires before deadline", stagedExpiry: covered, activeExpiry: overlapDeadline.Add(-time.Nanosecond), wantConflict: true},
+		{name: "active expires at deadline", stagedExpiry: covered, activeExpiry: overlapDeadline, wantConflict: true},
+		{name: "both expire strictly after deadline", stagedExpiry: covered, activeExpiry: covered},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			activeValues := lifecyclePGTokenValues(lifecyclePGTestRecordOne, "active", lifecyclePGNow.Add(-2*time.Minute))
+			activeValues[10] = pgtype.Timestamptz{Time: test.activeExpiry, Valid: true}
+			stagedValues := lifecyclePGTokenValues(lifecyclePGTestRecordTwo, "staged", lifecyclePGNow.Add(-time.Minute))
+			stagedValues[10] = pgtype.Timestamptz{Time: test.stagedExpiry, Valid: true}
+			transaction := lifecyclePGTransactionFor(activeValues, stagedValues)
+			repository, connection, _ := lifecyclePGRepository(transaction)
+			err := repository.ActivateRotation(context.Background(), securitystate.ActivateRotationCommand{
+				AudienceID: audience, DestinationID: destination, StagedRecordID: staged,
+				OldActiveRecordID: oldActive, Now: lifecyclePGNow, OverlapDeadline: overlapDeadline,
+			})
+
+			execCalls := 0
+			for _, call := range transaction.calls {
+				if call.kind == "exec" {
+					execCalls++
+				}
+			}
+			if test.wantConflict {
+				assertLifecyclePGSafe(t, err, securitystate.ErrDestinationLifecycleConflict, nil)
+				if errors.Is(err, securitystate.ErrDestinationLifecycleOutcomeUnknown) || execCalls != 0 ||
+					transaction.commitCalls != 0 || transaction.rollbackCalls != 1 || !transaction.rollbackBound ||
+					connection.releases != 1 || connection.destroys != 0 {
+					t.Fatal("insufficient rotation overlap coverage crossed the transaction boundary")
+				}
+				if len(transaction.calls) != 3 || transaction.calls[0].sql != lockLifecycleDestinationSQL ||
+					transaction.calls[1].sql != lockLifecycleTokensSQL || transaction.calls[2].kind != "rollback" {
+					t.Fatal("rotation overlap rejection occurred outside the locked precondition boundary")
+				}
+				return
+			}
+			if err != nil || execCalls != 2 || transaction.commitCalls != 1 || transaction.rollbackCalls != 0 ||
+				connection.releases != 1 || connection.destroys != 0 {
+				t.Fatal("full rotation overlap coverage was not committed")
+			}
+		})
+	}
+}
+
 func TestDestinationTokenLifecycleInspectionUsesConsistentReadAndNoMutation(t *testing.T) {
 	transaction := lifecyclePGTransactionFor(lifecyclePGTokenValues(lifecyclePGTestRecordOne, "active", lifecyclePGNow.Add(-time.Minute)))
 	repository, connection, _ := lifecyclePGRepository(transaction)

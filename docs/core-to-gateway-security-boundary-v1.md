@@ -447,7 +447,11 @@ The future rotation coordinator must implement exactly this bounded sequence:
 3. As part of that same transaction, give the old token one overlap deadline no
    later than 24 hours from the transaction's confirmed activation time. The
    deadline is immutable and cannot be extended by retry or rollback. The staged
-   cleanup deadline does not reduce this post-activation drain interval. If the
+   cleanup deadline does not reduce this post-activation drain interval. Token
+   lifetime begins at staged-token creation, so both the new staged token and
+   old active token must expire strictly after the complete overlap deadline;
+   equality is insufficient. Activation fails as a precondition conflict before
+   mutation rather than shortening or recalculating the deadline. If the
    transaction is confirmed not committed, the old token remains active and the
    new token remains non-resolving until confirmed revocation or its staged
    cleanup deadline.

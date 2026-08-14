@@ -148,6 +148,16 @@ type lifecycleErrorReader struct{ err error }
 
 func (reader lifecycleErrorReader) Read([]byte) (int, error) { return 0, reader.err }
 
+type lifecycleCountingReader struct{ calls int }
+
+func (reader *lifecycleCountingReader) Read(buffer []byte) (int, error) {
+	reader.calls++
+	for index := range buffer {
+		buffer[index] = byte(index)
+	}
+	return len(buffer), nil
+}
+
 func mustLifecycleAudience(t *testing.T) GatewayAudienceID {
 	t.Helper()
 	value, err := ParseGatewayAudienceID(lifecycleTestAudienceText)
@@ -275,6 +285,45 @@ func TestDestinationLifecycleConfigurationBounds(t *testing.T) {
 		if service != nil || !errors.Is(err, ErrDestinationLifecycleInvalid) {
 			t.Fatal("invalid lifecycle configuration was accepted")
 		}
+	}
+}
+
+func TestDestinationLifecycleTokenLifetimeExceedsRetiringOverlap(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		lifetime time.Duration
+		valid    bool
+	}{
+		{name: "shorter", lifetime: 6*time.Hour - time.Nanosecond},
+		{name: "equal", lifetime: 6 * time.Hour},
+		{name: "strictly longer", lifetime: 6*time.Hour + time.Nanosecond, valid: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repository := &lifecycleTestRepository{}
+			clock := &lifecycleTestClock{now: lifecycleTestNow}
+			random := &lifecycleCountingReader{}
+			generator := &lifecycleTestRecordGenerator{records: []DestinationTokenRecordID{
+				mustLifecycleRecordID(t, lifecycleTestRecordOneText),
+			}}
+			keySource := &lifecycleTestKeySource{key: mustLifecycleKey(t)}
+			service, err := NewDestinationTokenLifecycleService(DestinationTokenLifecycleConfig{
+				Clock: clock, Random: random, RecordIDs: generator, Repository: repository,
+				VerifierKeys: keySource, ActiveVerifierKeyID: mustLifecycleKeyID(t),
+				TokenLifetime: test.lifetime, StagedCleanupDuration: time.Hour,
+				RetiringOverlap: 6 * time.Hour,
+			})
+			if test.valid {
+				if err != nil || service == nil {
+					t.Fatal("strictly longer lifecycle token lifetime was rejected")
+				}
+			} else if service != nil || err != ErrDestinationLifecycleInvalid {
+				t.Fatal("unsafe lifecycle token lifetime was accepted")
+			}
+			if clock.callCount() != 0 || random.calls != 0 || generator.calls != 0 ||
+				keySource.calls != 0 || len(repository.callSnapshot()) != 0 {
+				t.Fatal("lifecycle configuration validation invoked a dependency")
+			}
+		})
 	}
 }
 

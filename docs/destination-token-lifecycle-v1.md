@@ -49,7 +49,8 @@ wrong record ID as idempotent success.
 The service receives an injected clock, random source, token-record-ID
 generator, active destination-verifier key source, lifecycle durations, and a
 narrow transaction repository. Token lifetime is positive and at most 90 days;
-staged cleanup and retiring overlap are positive and at most 24 hours. Invalid
+staged cleanup and retiring overlap are positive and at most 24 hours. Token
+lifetime must also be strictly longer than retiring overlap. Invalid
 configuration fails before a dependency is used.
 
 One top-level operation reads the clock once. `CreateStagedToken` also generates
@@ -81,11 +82,17 @@ active or retiring state. At most one staged, one active and one retiring row
 may be represented, and the service refuses any transition that would create a
 third live or pending token.
 
-Initial activation is one staged-to-active update. Rotation activation updates
-the old active row to retiring and the new staged row to active in the same
-transaction. The overlap deadline is calculated from the single clock snapshot
-and never extended by retry or rollback. Rollback and finalization require the
-exact current pair; duplicate, stale and mismatched transitions fail closed.
+Token validity starts when the staged token is created, not when it is
+activated. Initial activation is one staged-to-active update. Rotation
+activation updates the old active row to retiring and the new staged row to
+active in the same transaction, but only when both token expiry timestamps are
+strictly later than the complete overlap deadline. Expiry at the exact deadline
+is insufficient because token validity is exclusive at expiry. Failure is a
+precondition conflict checked after the locked state is reconstructed and
+before any mutation or commit; the transaction is rolled back, and the overlap
+deadline is never shortened, truncated or recalculated to fit either token.
+Rollback and finalization require the exact current pair; duplicate, stale and
+mismatched transitions fail closed.
 
 Inspection uses one repeatable-read, read-only transaction and the same
 complete-state reconstruction rules. It distinguishes unprovisioned, staged
