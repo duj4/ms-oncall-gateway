@@ -80,7 +80,10 @@ content-free server-side classifications. They include acquire, query or scan
 failure; nil dependencies or rows; invalid configuration; unavailable keys;
 malformed or cross-bound records; verifier or key-ID mismatch; and multiple
 matches across the configured key set. None is downgraded to not-found.
-Cancellation and deadline remain recognizable and take priority. Connection
+Cancellation and deadline remain recognizable at preflight and from a strict
+single-cause dependency error. A joined or mixed dependency error remains
+unavailable even if the caller is concurrently canceled or reaches its
+deadline, so classification does not depend on caller timing. Connection
 interruptions destroy the acquired connection; confirmed ordinary failures
 release it. The resolver performs no retry, replay, compensation query, log,
 metric or trace.
@@ -103,13 +106,14 @@ and owns and removes only its fixed test realm, destination and token rows in
 dependency order. When disabled it uses the repository's existing exact skip
 reason. It is not HA/DR, failover, fencing, RPO or RTO evidence.
 
-The separately authorized Destination Token Lifecycle Transaction Foundation V1
-checkpoint is in review. It adds transaction-scoped creation and lifecycle
-primitives but does not change this resolver's read behavior.
+Destination Token Lifecycle Transaction Foundation V1 was accepted in Gateway
+PR #12 at merge commit
+`09bd3bbe84dcca72a7221454e62777a4e29e20c2`. The in-review rotation participant
+reuses this resolver's verifier, keyring and indexed query boundary to classify
+a candidate token only against an exact rotation attempt.
 
-The accepted resolver does not implement the privileged Core mutation, the
-cross-repository rotation coordinator, a production key source, HTTP
-authentication/resolution composition, status mapping, runtime wiring, replay
-cleanup, provider work or `202 Accepted`. Gateway runtime remains deliberately
-wired to `UnavailableSink`; otherwise-valid webhooks continue to receive
-`503 Service Unavailable`.
+The accepted resolver still does not implement privileged Core mutation, a
+production key source, HTTP authentication/resolution composition, status
+mapping, runtime wiring, replay cleanup, provider work or `202 Accepted`.
+Gateway runtime remains deliberately wired to `UnavailableSink`;
+otherwise-valid webhooks continue to receive `503 Service Unavailable`.

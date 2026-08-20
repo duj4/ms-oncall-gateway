@@ -3,6 +3,7 @@ package securitystate
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -43,27 +44,32 @@ const (
 type LifecycleTokenView struct {
 	recordID              DestinationTokenRecordID
 	state                 DestinationTokenState
+	createdAt             time.Time
 	expiresAt             time.Time
 	stagedCleanupDeadline time.Time
 	activatedAt           time.Time
 	retirementStartedAt   time.Time
 	retirementDeadline    time.Time
+	revokedAt             time.Time
 	stateChangedAt        time.Time
 }
 
 func (value LifecycleTokenView) RecordID() DestinationTokenRecordID { return value.recordID }
 func (value LifecycleTokenView) State() DestinationTokenState       { return value.state }
+func (value LifecycleTokenView) CreatedAt() time.Time               { return value.createdAt }
 func (value LifecycleTokenView) ExpiresAt() time.Time               { return value.expiresAt }
 func (value LifecycleTokenView) StagedCleanupDeadline() time.Time   { return value.stagedCleanupDeadline }
 func (value LifecycleTokenView) ActivatedAt() time.Time             { return value.activatedAt }
 func (value LifecycleTokenView) RetirementStartedAt() time.Time     { return value.retirementStartedAt }
 func (value LifecycleTokenView) RetirementDeadline() time.Time      { return value.retirementDeadline }
+func (value LifecycleTokenView) RevokedAt() time.Time               { return value.revokedAt }
 func (value LifecycleTokenView) StateChangedAt() time.Time          { return value.stateChangedAt }
 func (LifecycleTokenView) Format(state fmt.State, verb rune)        { writeRedacted(state) }
 
 type DestinationLifecycleSnapshot struct {
 	audienceID                        GatewayAudienceID
 	destinationID                     DestinationID
+	destinationEnabled                bool
 	status                            DestinationLifecycleStatus
 	staged                            LifecycleTokenView
 	active                            LifecycleTokenView
@@ -74,6 +80,7 @@ type DestinationLifecycleSnapshot struct {
 func (value DestinationLifecycleSnapshot) Status() DestinationLifecycleStatus { return value.status }
 func (value DestinationLifecycleSnapshot) AudienceID() GatewayAudienceID      { return value.audienceID }
 func (value DestinationLifecycleSnapshot) DestinationID() DestinationID       { return value.destinationID }
+func (value DestinationLifecycleSnapshot) DestinationEnabled() bool           { return value.destinationEnabled }
 func (value DestinationLifecycleSnapshot) Staged() (LifecycleTokenView, bool) {
 	return value.staged, value.hasStaged
 }
@@ -97,7 +104,11 @@ func NewDestinationLifecycleSnapshot(
 		return DestinationLifecycleSnapshot{}, ErrDestinationLifecycleReconciliation
 	}
 
-	result := DestinationLifecycleSnapshot{audienceID: destination.audienceID, destinationID: destination.id}
+	result := DestinationLifecycleSnapshot{
+		audienceID:         destination.audienceID,
+		destinationID:      destination.id,
+		destinationEnabled: destination.Enabled(),
+	}
 	// A disabled destination is not provisionable, even when it has no token
 	// rows. Inspection must not collapse that state into the enabled-empty
 	// LifecycleUnprovisioned state that permits staged-token creation.
@@ -171,10 +182,60 @@ func NewDestinationLifecycleSnapshot(
 func lifecycleTokenView(token DestinationToken) LifecycleTokenView {
 	return LifecycleTokenView{
 		recordID: token.spec.RecordID, state: token.spec.State,
-		expiresAt: token.spec.ExpiresAt, stagedCleanupDeadline: token.spec.StagedCleanupDeadline,
-		activatedAt: token.spec.ActivatedAt, retirementStartedAt: token.spec.RetirementStartedAt,
-		retirementDeadline: token.spec.RetirementDeadline, stateChangedAt: token.spec.StateChangedAt,
+		createdAt: token.spec.CreatedAt, expiresAt: token.spec.ExpiresAt,
+		stagedCleanupDeadline: token.spec.StagedCleanupDeadline,
+		activatedAt:           token.spec.ActivatedAt, retirementStartedAt: token.spec.RetirementStartedAt,
+		retirementDeadline: token.spec.RetirementDeadline, revokedAt: token.spec.RevokedAt,
+		stateChangedAt: token.spec.StateChangedAt,
 	}
+}
+
+// DestinationTokenRotationAttemptSnapshot contains only bounded lifecycle
+// metadata. The verifier, verifier key and raw token are deliberately absent.
+type DestinationTokenRotationAttemptSnapshot struct {
+	lifecycle DestinationLifecycleSnapshot
+	newToken  LifecycleTokenView
+	oldToken  LifecycleTokenView
+}
+
+func NewDestinationTokenRotationAttemptSnapshot(
+	lifecycle DestinationLifecycleSnapshot,
+	newToken DestinationToken,
+	oldToken DestinationToken,
+	newActiveRecordID DestinationTokenRecordID,
+	oldRetiringRecordID DestinationTokenRecordID,
+	now time.Time,
+) (DestinationTokenRotationAttemptSnapshot, error) {
+	if lifecycle.audienceID.IsZero() || lifecycle.destinationID.IsZero() || now.IsZero() ||
+		newActiveRecordID.IsZero() || oldRetiringRecordID.IsZero() ||
+		newActiveRecordID == oldRetiringRecordID ||
+		newToken.spec.RecordID != newActiveRecordID || oldToken.spec.RecordID != oldRetiringRecordID ||
+		newToken.spec.AudienceID != lifecycle.audienceID || oldToken.spec.AudienceID != lifecycle.audienceID ||
+		newToken.spec.Destination.id != lifecycle.destinationID || oldToken.spec.Destination.id != lifecycle.destinationID ||
+		newToken.spec.CreatedAt.After(now) || oldToken.spec.CreatedAt.After(now) ||
+		newToken.spec.StateChangedAt.After(now) || oldToken.spec.StateChangedAt.After(now) ||
+		(!newToken.spec.RevokedAt.IsZero() && newToken.spec.RevokedAt.After(now)) ||
+		(!oldToken.spec.RevokedAt.IsZero() && oldToken.spec.RevokedAt.After(now)) {
+		return DestinationTokenRotationAttemptSnapshot{}, ErrDestinationLifecycleReconciliation
+	}
+	return DestinationTokenRotationAttemptSnapshot{
+		lifecycle: lifecycle,
+		newToken:  lifecycleTokenView(newToken),
+		oldToken:  lifecycleTokenView(oldToken),
+	}, nil
+}
+
+func (value DestinationTokenRotationAttemptSnapshot) Lifecycle() DestinationLifecycleSnapshot {
+	return value.lifecycle
+}
+func (value DestinationTokenRotationAttemptSnapshot) NewToken() LifecycleTokenView {
+	return value.newToken
+}
+func (value DestinationTokenRotationAttemptSnapshot) OldToken() LifecycleTokenView {
+	return value.oldToken
+}
+func (DestinationTokenRotationAttemptSnapshot) Format(state fmt.State, verb rune) {
+	writeRedacted(state)
 }
 
 type StagedTokenCandidate struct {
@@ -218,6 +279,53 @@ func (value StagedTokenCandidate) StagedCleanupDeadline() time.Time {
 }
 func (StagedTokenCandidate) Format(state fmt.State, verb rune) { writeRedacted(state) }
 
+// CreateRotationStagedTokenCommand binds creation of a rotation candidate to
+// the exact active record observed by the participant. It deliberately carries
+// neither the current nor generated raw token.
+type CreateRotationStagedTokenCommand struct {
+	candidate              StagedTokenCandidate
+	expectedActiveRecordID DestinationTokenRecordID
+	now                    time.Time
+}
+
+func NewCreateRotationStagedTokenCommand(
+	candidate StagedTokenCandidate,
+	expectedActiveRecordID DestinationTokenRecordID,
+	now time.Time,
+) (CreateRotationStagedTokenCommand, error) {
+	validated, err := NewStagedTokenCandidate(
+		candidate.AudienceID(),
+		candidate.DestinationID(),
+		candidate.RecordID(),
+		candidate.Verifier(),
+		candidate.VerifierKeyID(),
+		candidate.CreatedAt(),
+		candidate.ExpiresAt(),
+		candidate.StagedCleanupDeadline(),
+	)
+	if err != nil || validated.RecordID() != candidate.RecordID() ||
+		expectedActiveRecordID.IsZero() || expectedActiveRecordID == candidate.RecordID() ||
+		now.IsZero() || !candidate.CreatedAt().Equal(now) {
+		return CreateRotationStagedTokenCommand{}, ErrDestinationLifecycleInvalid
+	}
+	return CreateRotationStagedTokenCommand{
+		candidate:              validated,
+		expectedActiveRecordID: expectedActiveRecordID,
+		now:                    now,
+	}, nil
+}
+
+func (value CreateRotationStagedTokenCommand) Candidate() StagedTokenCandidate {
+	return value.candidate
+}
+func (value CreateRotationStagedTokenCommand) ExpectedActiveRecordID() DestinationTokenRecordID {
+	return value.expectedActiveRecordID
+}
+func (value CreateRotationStagedTokenCommand) Now() time.Time { return value.now }
+func (CreateRotationStagedTokenCommand) Format(state fmt.State, verb rune) {
+	writeRedacted(state)
+}
+
 type ActivateRotationCommand struct {
 	AudienceID        GatewayAudienceID
 	DestinationID     DestinationID
@@ -225,6 +333,53 @@ type ActivateRotationCommand struct {
 	OldActiveRecordID DestinationTokenRecordID
 	Now               time.Time
 	OverlapDeadline   time.Time
+}
+
+// DestinationTokenRotationActivationReceipt is returned only after the
+// repository has confirmed the exact rotation activation. Its immutable
+// activation time and retirement deadline are the same values supplied to the
+// committed repository command.
+type DestinationTokenRotationActivationReceipt struct {
+	activatedAt        time.Time
+	retirementDeadline time.Time
+}
+
+func NewDestinationTokenRotationActivationReceipt(
+	activatedAt time.Time,
+	retirementDeadline time.Time,
+) (DestinationTokenRotationActivationReceipt, error) {
+	receipt := DestinationTokenRotationActivationReceipt{
+		activatedAt: activatedAt, retirementDeadline: retirementDeadline,
+	}
+	if !receipt.valid() {
+		return DestinationTokenRotationActivationReceipt{}, ErrDestinationLifecycleInvalid
+	}
+	return receipt, nil
+}
+
+func (value DestinationTokenRotationActivationReceipt) RetirementDeadline() time.Time {
+	return value.retirementDeadline
+}
+
+func (value DestinationTokenRotationActivationReceipt) ActivatedAt() time.Time {
+	return value.activatedAt
+}
+
+func (value DestinationTokenRotationActivationReceipt) valid() bool {
+	return !value.activatedAt.IsZero() &&
+		value.activatedAt.Equal(canonicalDestinationLifecycleTimestamp(value.activatedAt)) &&
+		value.retirementDeadline.Equal(canonicalDestinationLifecycleTimestamp(value.retirementDeadline)) &&
+		value.retirementDeadline.After(value.activatedAt) &&
+		value.retirementDeadline.Sub(value.activatedAt) <= MaximumRetiringOverlapDuration
+}
+
+func (value DestinationTokenRotationActivationReceipt) validAt(now time.Time) bool {
+	return value.valid() && !now.IsZero() && !now.Before(value.activatedAt) &&
+		now.Before(value.retirementDeadline)
+}
+
+func (DestinationTokenRotationActivationReceipt) Format(state fmt.State, verb rune) {
+	writeRedacted(state)
 }
 
 type RollbackRotationCommand struct {
@@ -352,6 +507,34 @@ func NewDestinationTokenLifecycleService(config DestinationTokenLifecycleConfig)
 }
 
 func (service *DestinationTokenLifecycleService) CreateStagedToken(ctx context.Context, audience GatewayAudienceID, destination DestinationID) (CreatedStagedToken, error) {
+	return service.createStagedToken(ctx, audience, destination, DestinationTokenRecordID{}, OpaqueDestinationToken{}, false)
+}
+
+// CreateRotationStagedToken creates a candidate only while the exact active
+// record observed by the participant remains authoritative. The current raw
+// token is compared in constant time before any repository call and is never
+// passed to persistence.
+func (service *DestinationTokenLifecycleService) CreateRotationStagedToken(
+	ctx context.Context,
+	audience GatewayAudienceID,
+	destination DestinationID,
+	expectedActiveRecordID DestinationTokenRecordID,
+	currentToken OpaqueDestinationToken,
+) (CreatedStagedToken, error) {
+	if expectedActiveRecordID.IsZero() {
+		return CreatedStagedToken{}, ErrDestinationLifecycleInvalid
+	}
+	return service.createStagedToken(ctx, audience, destination, expectedActiveRecordID, currentToken, true)
+}
+
+func (service *DestinationTokenLifecycleService) createStagedToken(
+	ctx context.Context,
+	audience GatewayAudienceID,
+	destination DestinationID,
+	expectedActiveRecordID DestinationTokenRecordID,
+	currentToken OpaqueDestinationToken,
+	rotation bool,
+) (CreatedStagedToken, error) {
 	now, err := service.operationInput(ctx, audience, destination)
 	if err != nil {
 		return CreatedStagedToken{}, err
@@ -376,6 +559,13 @@ func (service *DestinationTokenLifecycleService) CreateStagedToken(ctx context.C
 	if err != nil {
 		return CreatedStagedToken{}, ErrDestinationLifecycleUnavailable
 	}
+	if rotation {
+		generatedBytes := rawToken.Bytes()
+		currentBytes := currentToken.Bytes()
+		if subtle.ConstantTimeCompare(generatedBytes[:], currentBytes[:]) == 1 {
+			return CreatedStagedToken{}, ErrDestinationLifecycleConflict
+		}
+	}
 	key, keyErr := service.keys.DestinationVerifierKey(ctx, audience, service.activeKeyID)
 	if cancellation := lifecycleCancellation(ctx, keyErr); cancellation != nil {
 		return CreatedStagedToken{}, cancellation
@@ -392,8 +582,25 @@ func (service *DestinationTokenLifecycleService) CreateStagedToken(ctx context.C
 	if candidateErr != nil {
 		return CreatedStagedToken{}, ErrDestinationLifecycleInvalid
 	}
-	if err := service.repository.CreateStagedToken(ctx, candidate, now); err != nil {
-		return CreatedStagedToken{}, classifyDestinationLifecycleError(ctx, err)
+	var repositoryErr error
+	if rotation {
+		command, commandErr := NewCreateRotationStagedTokenCommand(candidate, expectedActiveRecordID, now)
+		if commandErr != nil {
+			return CreatedStagedToken{}, ErrDestinationLifecycleInvalid
+		}
+		repositoryErr = service.repository.CreateRotationStagedToken(ctx, command)
+	} else {
+		repositoryErr = service.repository.CreateStagedToken(ctx, candidate, now)
+	}
+	if repositoryErr != nil {
+		classified := classifyDestinationLifecycleError(ctx, repositoryErr)
+		if classified == ErrDestinationLifecycleOutcomeUnknown {
+			// The generated record identity is safe to retain for exact
+			// reconciliation, but the one-time token must never escape when the
+			// insert acknowledgement is ambiguous.
+			return CreatedStagedToken{recordID: recordID}, classified
+		}
+		return CreatedStagedToken{}, classified
 	}
 	return CreatedStagedToken{recordID: recordID, token: OneTimeDestinationToken{encoded: encoded}}, nil
 }
@@ -406,15 +613,38 @@ func (service *DestinationTokenLifecycleService) ActivateInitialToken(ctx contex
 	return classifyDestinationLifecycleError(ctx, service.repository.ActivateInitialToken(ctx, audience, destination, staged, now))
 }
 
-func (service *DestinationTokenLifecycleService) ActivateRotation(ctx context.Context, audience GatewayAudienceID, destination DestinationID, staged, oldActive DestinationTokenRecordID) error {
+func (service *DestinationTokenLifecycleService) ActivateRotation(
+	ctx context.Context,
+	audience GatewayAudienceID,
+	destination DestinationID,
+	staged DestinationTokenRecordID,
+	oldActive DestinationTokenRecordID,
+) (DestinationTokenRotationActivationReceipt, error) {
 	now, err := service.pairOperationInput(ctx, audience, destination, staged, oldActive)
 	if err != nil {
-		return err
+		return DestinationTokenRotationActivationReceipt{}, err
 	}
-	return classifyDestinationLifecycleError(ctx, service.repository.ActivateRotation(ctx, ActivateRotationCommand{
+	// pgx encodes PostgreSQL timestamps at microsecond precision. Canonicalize
+	// both values from the same raw clock snapshot before either the repository
+	// command or its receipt is constructed.
+	activatedAt := canonicalDestinationLifecycleTimestamp(now)
+	retirementDeadline := canonicalDestinationLifecycleTimestamp(now.Add(service.overlapDuration))
+	receipt, err := NewDestinationTokenRotationActivationReceipt(activatedAt, retirementDeadline)
+	if err != nil {
+		return DestinationTokenRotationActivationReceipt{}, ErrDestinationLifecycleInvalid
+	}
+	err = classifyDestinationLifecycleError(ctx, service.repository.ActivateRotation(ctx, ActivateRotationCommand{
 		AudienceID: audience, DestinationID: destination, StagedRecordID: staged,
-		OldActiveRecordID: oldActive, Now: now, OverlapDeadline: now.Add(service.overlapDuration),
+		OldActiveRecordID: oldActive, Now: activatedAt, OverlapDeadline: retirementDeadline,
 	}))
+	if err != nil {
+		return DestinationTokenRotationActivationReceipt{}, err
+	}
+	return receipt, nil
+}
+
+func canonicalDestinationLifecycleTimestamp(value time.Time) time.Time {
+	return value.Truncate(time.Microsecond)
 }
 
 func (service *DestinationTokenLifecycleService) AbortStagedToken(ctx context.Context, audience GatewayAudienceID, destination DestinationID, staged DestinationTokenRecordID) error {
@@ -457,7 +687,7 @@ func (service *DestinationTokenLifecycleService) InspectLifecycleState(ctx conte
 	}
 	snapshot, repositoryErr := service.repository.InspectLifecycleState(ctx, audience, destination, now)
 	if repositoryErr != nil {
-		return DestinationLifecycleSnapshot{}, classifyDestinationLifecycleError(ctx, repositoryErr)
+		return DestinationLifecycleSnapshot{}, classifyDestinationLifecycleInspectionError(repositoryErr)
 	}
 	if snapshot.status == 0 || snapshot.audienceID != audience || snapshot.destinationID != destination {
 		return DestinationLifecycleSnapshot{}, ErrDestinationLifecycleReconciliation
@@ -502,15 +732,21 @@ func (service *DestinationTokenLifecycleService) pairOperationInput(ctx context.
 	return now, nil
 }
 
-func classifyDestinationLifecycleError(ctx context.Context, err error) error {
+func classifyDestinationLifecycleError(_ context.Context, err error) error {
 	if err == nil {
 		return nil
 	}
 	// A possibly committed mutation is more specific than cancellation. The
 	// caller must reconcile it and must never replay merely because its context
 	// also expired while PostgreSQL's acknowledgement was lost.
-	if errors.Is(err, ErrDestinationLifecycleOutcomeUnknown) {
+	if lifecycleSingleCauseMatches(err, ErrDestinationLifecycleOutcomeUnknown) {
 		return ErrDestinationLifecycleOutcomeUnknown
+	}
+	if lifecycleSingleCauseMatches(err, context.Canceled) {
+		return ErrDestinationLifecycleCanceled
+	}
+	if lifecycleSingleCauseMatches(err, context.DeadlineExceeded) {
+		return ErrDestinationLifecycleDeadline
 	}
 	if lifecycleSingleCauseMatches(err, ErrDestinationLifecycleCanceled) {
 		return ErrDestinationLifecycleCanceled
@@ -518,15 +754,37 @@ func classifyDestinationLifecycleError(ctx context.Context, err error) error {
 	if lifecycleSingleCauseMatches(err, ErrDestinationLifecycleDeadline) {
 		return ErrDestinationLifecycleDeadline
 	}
-	if cancellation := lifecycleCancellation(ctx, err); cancellation != nil {
-		return cancellation
-	}
 	for _, safe := range []error{ErrDestinationLifecycleInvalid, ErrDestinationLifecycleConflict,
 		ErrDestinationLifecycleReconciliation, ErrDestinationLifecycleUnavailable,
 	} {
 		if lifecycleSingleCauseMatches(err, safe) {
 			return safe
 		}
+	}
+	return ErrDestinationLifecycleOutcomeUnknown
+}
+
+func classifyDestinationLifecycleInspectionError(err error) error {
+	if err == nil {
+		return nil
+	}
+	for _, safe := range []error{
+		ErrDestinationLifecycleCanceled,
+		ErrDestinationLifecycleDeadline,
+		ErrDestinationLifecycleInvalid,
+		ErrDestinationLifecycleConflict,
+		ErrDestinationLifecycleReconciliation,
+		ErrDestinationLifecycleUnavailable,
+	} {
+		if lifecycleSingleCauseMatches(err, safe) {
+			return safe
+		}
+	}
+	if lifecycleSingleCauseMatches(err, context.Canceled) {
+		return ErrDestinationLifecycleCanceled
+	}
+	if lifecycleSingleCauseMatches(err, context.DeadlineExceeded) {
+		return ErrDestinationLifecycleDeadline
 	}
 	return ErrDestinationLifecycleUnavailable
 }
@@ -548,10 +806,19 @@ func lifecycleSingleCauseMatches(err, target error) bool {
 }
 
 func lifecycleCancellation(ctx context.Context, err error) error {
-	if errors.Is(err, context.Canceled) || (!nilLifecycleDependency(ctx) && errors.Is(ctx.Err(), context.Canceled)) {
+	if err != nil {
+		if lifecycleSingleCauseMatches(err, context.Canceled) {
+			return ErrDestinationLifecycleCanceled
+		}
+		if lifecycleSingleCauseMatches(err, context.DeadlineExceeded) {
+			return ErrDestinationLifecycleDeadline
+		}
+		return nil
+	}
+	if !nilLifecycleDependency(ctx) && ctx.Err() == context.Canceled {
 		return ErrDestinationLifecycleCanceled
 	}
-	if errors.Is(err, context.DeadlineExceeded) || (!nilLifecycleDependency(ctx) && errors.Is(ctx.Err(), context.DeadlineExceeded)) {
+	if !nilLifecycleDependency(ctx) && ctx.Err() == context.DeadlineExceeded {
 		return ErrDestinationLifecycleDeadline
 	}
 	return nil

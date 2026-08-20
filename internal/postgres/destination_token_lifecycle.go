@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"reflect"
 	"time"
 
 	"github.com/duj4/ms-oncall-gateway/internal/securitystate"
@@ -82,6 +83,29 @@ const inspectLifecycleTokensSQL = `
 	  and token_state is distinct from 'revoked'
 	order by token_state, destination_token_record_id
 	limit 4
+`
+
+const inspectRotationAttemptTokensSQL = `
+	select
+		destination_token_record_id::text,
+		gateway_audience_id::text,
+		destination_id::text,
+		token_verifier,
+		verifier_key_id,
+		token_state,
+		created_at,
+		activated_at,
+		retirement_started_at,
+		revoked_at,
+		expires_at,
+		staged_cleanup_deadline,
+		retirement_overlap_deadline,
+		state_changed_at
+	from gateway_destination_tokens
+	where gateway_audience_id = $1
+	  and destination_id = $2
+	  and destination_token_record_id in ($3, $4)
+	order by destination_token_record_id
 `
 
 const insertLifecycleStagedTokenSQL = `
@@ -213,6 +237,7 @@ type DestinationTokenLifecycleRepository struct {
 }
 
 var _ securitystate.DestinationTokenLifecycleRepository = (*DestinationTokenLifecycleRepository)(nil)
+var _ securitystate.DestinationTokenRotationAttemptInspector = (*DestinationTokenLifecycleRepository)(nil)
 
 func NewDestinationTokenLifecycleRepository(pool Pool) *DestinationTokenLifecycleRepository {
 	if nilInterface(pool) {
@@ -347,32 +372,83 @@ func (repository *DestinationTokenLifecycleRepository) CreateStagedToken(
 				return securitystate.ErrDestinationLifecycleReconciliation
 			}
 			switch state.snapshot.Status() {
-			case securitystate.LifecycleUnprovisioned, securitystate.LifecycleActive:
+			case securitystate.LifecycleUnprovisioned:
 			case securitystate.LifecycleReconciliationRequired:
 				return securitystate.ErrDestinationLifecycleReconciliation
 			default:
 				return securitystate.ErrDestinationLifecycleConflict
 			}
-			verifier := candidate.Verifier().Bytes()
-			*mutationSent = true
-			tag, execErr := transaction.Exec(
-				ctx,
-				insertLifecycleStagedTokenSQL,
-				candidate.RecordID().String(),
-				candidate.AudienceID().String(),
-				candidate.DestinationID().String(),
-				append([]byte(nil), verifier[:]...),
-				candidate.VerifierKeyID().Value(),
-				candidate.CreatedAt(),
-				candidate.ExpiresAt(),
-				candidate.StagedCleanupDeadline(),
-			)
-			if execErr != nil {
-				return lifecycleMutationError(execErr)
-			}
-			return lifecycleRowsAffected(tag)
+			return insertLifecycleStagedToken(ctx, transaction, candidate, mutationSent)
 		},
 	)
+}
+
+func (repository *DestinationTokenLifecycleRepository) CreateRotationStagedToken(
+	ctx context.Context,
+	command securitystate.CreateRotationStagedTokenCommand,
+) error {
+	candidate := command.Candidate()
+	validated, err := securitystate.NewCreateRotationStagedTokenCommand(
+		candidate,
+		command.ExpectedActiveRecordID(),
+		command.Now(),
+	)
+	if err != nil || validated.ExpectedActiveRecordID() != command.ExpectedActiveRecordID() {
+		return lifecycleRepositoryError(securitystate.ErrDestinationLifecycleInvalid, "rotation staged token input")
+	}
+	candidate = validated.Candidate()
+	expectedActiveRecordID := validated.ExpectedActiveRecordID()
+	now := validated.Now()
+	return repository.runLifecycleMutation(
+		ctx,
+		candidate.AudienceID(),
+		candidate.DestinationID(),
+		now,
+		func(
+			ctx context.Context,
+			transaction destinationTokenLifecycleTransaction,
+			state lifecycleLockedState,
+			mutationSent *bool,
+		) error {
+			if !state.destination.Enabled() || state.snapshot.Status() == securitystate.LifecycleReconciliationRequired {
+				return securitystate.ErrDestinationLifecycleReconciliation
+			}
+			active, hasActive := state.snapshot.Active()
+			_, hasStaged := state.snapshot.Staged()
+			_, hasRetiring := state.snapshot.Retiring()
+			if state.snapshot.Status() != securitystate.LifecycleActive || !hasActive || hasStaged || hasRetiring ||
+				active.RecordID() != expectedActiveRecordID {
+				return securitystate.ErrDestinationLifecycleConflict
+			}
+			return insertLifecycleStagedToken(ctx, transaction, candidate, mutationSent)
+		},
+	)
+}
+
+func insertLifecycleStagedToken(
+	ctx context.Context,
+	transaction destinationTokenLifecycleTransaction,
+	candidate securitystate.StagedTokenCandidate,
+	mutationSent *bool,
+) error {
+	verifier := candidate.Verifier().Bytes()
+	*mutationSent = true
+	tag, execErr := transaction.Exec(
+		ctx,
+		insertLifecycleStagedTokenSQL,
+		candidate.RecordID().String(),
+		candidate.AudienceID().String(),
+		candidate.DestinationID().String(),
+		append([]byte(nil), verifier[:]...),
+		candidate.VerifierKeyID().Value(),
+		candidate.CreatedAt(),
+		candidate.ExpiresAt(),
+		candidate.StagedCleanupDeadline(),
+	)
+	if execErr != nil {
+		return lifecycleMutationError(execErr)
+	}
+	return lifecycleRowsAffected(tag)
 }
 
 func (repository *DestinationTokenLifecycleRepository) ActivateInitialToken(
@@ -609,12 +685,20 @@ func (repository *DestinationTokenLifecycleRepository) InspectLifecycleState(
 		IsoLevel:   pgx.RepeatableRead,
 		AccessMode: pgx.ReadOnly,
 	})
-	if err != nil || nilInterface(transaction) {
-		if isConnectionInterruption(err) || nilInterface(transaction) {
+	if err != nil {
+		if lifecycleUnsafeOrConnectionInterruption(err) {
 			connection.Destroy()
 			release = false
 		}
 		return securitystate.DestinationLifecycleSnapshot{}, lifecycleConnectionError(ctx, err, "lifecycle inspection begin")
+	}
+	if nilInterface(transaction) {
+		connection.Destroy()
+		release = false
+		return securitystate.DestinationLifecycleSnapshot{}, lifecycleRepositoryError(
+			securitystate.ErrDestinationLifecycleUnavailable,
+			"lifecycle inspection begin",
+		)
 	}
 	transactionOpen := true
 	defer func() {
@@ -656,6 +740,208 @@ func (repository *DestinationTokenLifecycleRepository) InspectLifecycleState(
 	return state.snapshot, nil
 }
 
+func (repository *DestinationTokenLifecycleRepository) InspectRotationAttempt(
+	ctx context.Context,
+	audience securitystate.GatewayAudienceID,
+	destination securitystate.DestinationID,
+	newActiveRecordID securitystate.DestinationTokenRecordID,
+	oldRetiringRecordID securitystate.DestinationTokenRecordID,
+	now time.Time,
+) (result securitystate.DestinationTokenRotationAttemptSnapshot, resultErr error) {
+	if err := validateLifecycleRepositoryInput(repository, ctx, audience, destination, now); err != nil ||
+		newActiveRecordID.IsZero() || oldRetiringRecordID.IsZero() ||
+		newActiveRecordID == oldRetiringRecordID {
+		if err != nil {
+			return securitystate.DestinationTokenRotationAttemptSnapshot{}, err
+		}
+		return securitystate.DestinationTokenRotationAttemptSnapshot{}, lifecycleRepositoryError(
+			securitystate.ErrDestinationLifecycleInvalid,
+			"rotation attempt inspection input",
+		)
+	}
+	connection, err := repository.acquire(ctx)
+	if err != nil {
+		if !nilInterface(connection) {
+			connection.Destroy()
+		}
+		return securitystate.DestinationTokenRotationAttemptSnapshot{}, lifecycleConnectionError(
+			ctx, err, "rotation attempt inspection connection",
+		)
+	}
+	if nilInterface(connection) {
+		return securitystate.DestinationTokenRotationAttemptSnapshot{}, lifecycleRepositoryError(
+			securitystate.ErrDestinationLifecycleUnavailable,
+			"rotation attempt inspection connection",
+		)
+	}
+	release := true
+	defer func() {
+		if release {
+			connection.Release()
+		}
+	}()
+
+	transaction, err := connection.Begin(ctx, pgx.TxOptions{
+		IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		if lifecycleUnsafeOrConnectionInterruption(err) {
+			connection.Destroy()
+			release = false
+		}
+		return securitystate.DestinationTokenRotationAttemptSnapshot{}, lifecycleConnectionError(
+			ctx, err, "rotation attempt inspection begin",
+		)
+	}
+	if nilInterface(transaction) {
+		connection.Destroy()
+		release = false
+		return securitystate.DestinationTokenRotationAttemptSnapshot{}, lifecycleRepositoryError(
+			securitystate.ErrDestinationLifecycleUnavailable,
+			"rotation attempt inspection begin",
+		)
+	}
+	transactionOpen := true
+	defer func() {
+		if !transactionOpen {
+			return
+		}
+		rollbackCtx, cancel := boundedCleanupContext(ctx, repository.rollbackTimeout)
+		rollbackErr := transaction.Rollback(rollbackCtx)
+		cancel()
+		transactionOpen = false
+		if rollbackErr != nil {
+			connection.Destroy()
+			release = false
+			result = securitystate.DestinationTokenRotationAttemptSnapshot{}
+			resultErr = lifecycleRepositoryError(
+				securitystate.ErrDestinationLifecycleUnavailable,
+				"rotation attempt inspection cleanup",
+			)
+		}
+	}()
+
+	state, err := loadDestinationLifecycleState(ctx, transaction, audience, destination, now, false)
+	if err != nil {
+		return securitystate.DestinationTokenRotationAttemptSnapshot{}, lifecycleRollbackRead(
+			ctx, repository, connection, transaction, &transactionOpen, &release, err,
+		)
+	}
+	rows, err := transaction.Query(
+		ctx,
+		inspectRotationAttemptTokensSQL,
+		audience.String(),
+		destination.String(),
+		newActiveRecordID.String(),
+		oldRetiringRecordID.String(),
+	)
+	if err != nil || nilInterface(rows) {
+		if !nilInterface(rows) {
+			rows.Close()
+			err = lifecycleCombinedReadCause(err, rows.Err())
+		}
+		if err == nil {
+			err = lifecycleInternalError{
+				kind: securitystate.ErrDestinationLifecycleUnavailable, destroy: true,
+			}
+		} else {
+			err = lifecycleReadError(ctx, err)
+		}
+		return securitystate.DestinationTokenRotationAttemptSnapshot{}, lifecycleRollbackRead(
+			ctx, repository, connection, transaction, &transactionOpen, &release, err,
+		)
+	}
+	var newToken, oldToken securitystate.DestinationToken
+	seen := 0
+	var readErr error
+	for rows.Next() {
+		if seen == 2 {
+			err = securitystate.ErrDestinationLifecycleReconciliation
+			break
+		}
+		record := lifecycleTokenRecord{}
+		if scanErr := rows.Scan(record.destinations()...); scanErr != nil {
+			if lifecycleUnsafeOrConnectionInterruption(scanErr) ||
+				lifecycleRepositoryCancellation(ctx, scanErr) != nil {
+				readErr = scanErr
+			} else {
+				err = securitystate.ErrDestinationLifecycleReconciliation
+			}
+			break
+		}
+		token, tokenErr := record.token(audience, state.destination)
+		if tokenErr != nil {
+			err = securitystate.ErrDestinationLifecycleReconciliation
+			break
+		}
+		switch token.RecordID() {
+		case newActiveRecordID:
+			if !newToken.RecordID().IsZero() {
+				err = securitystate.ErrDestinationLifecycleReconciliation
+			} else {
+				newToken = token
+			}
+		case oldRetiringRecordID:
+			if !oldToken.RecordID().IsZero() {
+				err = securitystate.ErrDestinationLifecycleReconciliation
+			} else {
+				oldToken = token
+			}
+		default:
+			err = securitystate.ErrDestinationLifecycleReconciliation
+		}
+		if err != nil {
+			break
+		}
+		seen++
+	}
+	// pgx requires the result set to be closed before this transaction can be
+	// committed or rolled back. Close explicitly on every parse/cardinality
+	// path, then observe the terminal rows error; a deferred close would run only
+	// after lifecycleRollbackRead and can leave the connection busy.
+	rows.Close()
+	rowsErr := rows.Err()
+	if rowsErr != nil {
+		switch {
+		case readErr != nil:
+			readErr = lifecycleCombinedReadCause(readErr, rowsErr)
+		case err != nil:
+			readErr = errors.Join(err, rowsErr)
+		default:
+			readErr = rowsErr
+		}
+	}
+	if readErr != nil {
+		err = lifecycleReadError(ctx, readErr)
+	}
+	if err == nil && (seen != 2 || newToken.RecordID().IsZero() || oldToken.RecordID().IsZero()) {
+		err = securitystate.ErrDestinationLifecycleConflict
+	}
+	if err != nil {
+		return securitystate.DestinationTokenRotationAttemptSnapshot{}, lifecycleRollbackRead(
+			ctx, repository, connection, transaction, &transactionOpen, &release, err,
+		)
+	}
+	result, err = securitystate.NewDestinationTokenRotationAttemptSnapshot(
+		state.snapshot, newToken, oldToken, newActiveRecordID, oldRetiringRecordID, now,
+	)
+	if err != nil {
+		return securitystate.DestinationTokenRotationAttemptSnapshot{}, lifecycleRollbackRead(
+			ctx, repository, connection, transaction, &transactionOpen, &release, err,
+		)
+	}
+	if err := transaction.Commit(ctx); err != nil {
+		transactionOpen = false
+		connection.Destroy()
+		release = false
+		return securitystate.DestinationTokenRotationAttemptSnapshot{}, lifecycleConnectionError(
+			ctx, err, "rotation attempt inspection commit",
+		)
+	}
+	transactionOpen = false
+	return result, nil
+}
+
 func (repository *DestinationTokenLifecycleRepository) runLifecycleMutation(
 	ctx context.Context,
 	audience securitystate.GatewayAudienceID,
@@ -690,12 +976,20 @@ func (repository *DestinationTokenLifecycleRepository) runLifecycleMutation(
 		IsoLevel:   pgx.ReadCommitted,
 		AccessMode: pgx.ReadWrite,
 	})
-	if err != nil || nilInterface(transaction) {
-		if isConnectionInterruption(err) || nilInterface(transaction) {
+	if err != nil {
+		if lifecycleUnsafeOrConnectionInterruption(err) {
 			connection.Destroy()
 			release = false
 		}
 		return lifecycleConnectionError(ctx, err, "lifecycle mutation begin")
+	}
+	if nilInterface(transaction) {
+		connection.Destroy()
+		release = false
+		return lifecycleRepositoryError(
+			securitystate.ErrDestinationLifecycleUnavailable,
+			"lifecycle mutation begin",
+		)
 	}
 	transactionOpen := true
 	defer func() {
@@ -784,10 +1078,16 @@ func (repository *DestinationTokenLifecycleRepository) rollbackLifecycleMutation
 		connection.Destroy()
 		*release = false
 	}
-	if errors.Is(cause, securitystate.ErrDestinationLifecycleCanceled) {
+	if lifecycleRepositorySingleCauseMatches(cause, securitystate.ErrDestinationLifecycleOutcomeUnknown) {
+		return lifecycleRepositoryError(
+			securitystate.ErrDestinationLifecycleOutcomeUnknown,
+			"lifecycle mutation",
+		)
+	}
+	if lifecycleRepositorySingleCauseMatches(cause, securitystate.ErrDestinationLifecycleCanceled) {
 		return lifecycleRepositoryError(securitystate.ErrDestinationLifecycleCanceled, "lifecycle mutation canceled")
 	}
-	if errors.Is(cause, securitystate.ErrDestinationLifecycleDeadline) {
+	if lifecycleRepositorySingleCauseMatches(cause, securitystate.ErrDestinationLifecycleDeadline) {
 		return lifecycleRepositoryError(securitystate.ErrDestinationLifecycleDeadline, "lifecycle mutation canceled")
 	}
 	if cancellation := lifecycleRepositoryCancellation(ctx, cause); cancellation != nil {
@@ -799,7 +1099,7 @@ func (repository *DestinationTokenLifecycleRepository) rollbackLifecycleMutation
 		securitystate.ErrDestinationLifecycleReconciliation,
 		securitystate.ErrDestinationLifecycleUnavailable,
 	} {
-		if errors.Is(cause, kind) {
+		if lifecycleRepositorySingleCauseMatches(cause, kind) {
 			return lifecycleRepositoryError(kind, "lifecycle mutation")
 		}
 	}
@@ -828,10 +1128,10 @@ func lifecycleRollbackRead(
 		connection.Destroy()
 		*release = false
 	}
-	if errors.Is(cause, securitystate.ErrDestinationLifecycleCanceled) {
+	if lifecycleRepositorySingleCauseMatches(cause, securitystate.ErrDestinationLifecycleCanceled) {
 		return lifecycleRepositoryError(securitystate.ErrDestinationLifecycleCanceled, "lifecycle inspection canceled")
 	}
-	if errors.Is(cause, securitystate.ErrDestinationLifecycleDeadline) {
+	if lifecycleRepositorySingleCauseMatches(cause, securitystate.ErrDestinationLifecycleDeadline) {
 		return lifecycleRepositoryError(securitystate.ErrDestinationLifecycleDeadline, "lifecycle inspection canceled")
 	}
 	if cancellation := lifecycleRepositoryCancellation(ctx, cause); cancellation != nil {
@@ -842,7 +1142,7 @@ func lifecycleRollbackRead(
 		securitystate.ErrDestinationLifecycleReconciliation,
 		securitystate.ErrDestinationLifecycleUnavailable,
 	} {
-		if errors.Is(cause, kind) {
+		if lifecycleRepositorySingleCauseMatches(cause, kind) {
 			return lifecycleRepositoryError(kind, "lifecycle inspection")
 		}
 	}
@@ -903,7 +1203,8 @@ func loadDestinationLifecycleState(
 		}
 		tokenRecord := lifecycleTokenRecord{}
 		if err := rows.Scan(tokenRecord.destinations()...); err != nil {
-			if isConnectionInterruption(err) || lifecycleRepositoryCancellation(ctx, err) != nil {
+			if lifecycleUnsafeOrConnectionInterruption(err) ||
+				lifecycleRepositoryCancellation(ctx, err) != nil {
 				return lifecycleLockedState{}, lifecycleReadError(ctx, err)
 			}
 			return lifecycleLockedState{}, securitystate.ErrDestinationLifecycleReconciliation
@@ -1130,6 +1431,11 @@ func lifecycleRowsAffected(tag pgconn.CommandTag) error {
 }
 
 func lifecycleMutationError(err error) error {
+	if !lifecycleRepositorySingleCauseChain(err) {
+		return lifecycleInternalError{
+			kind: securitystate.ErrDestinationLifecycleOutcomeUnknown, destroy: true,
+		}
+	}
 	if cancellation := lifecycleRepositoryCancellation(nil, err); cancellation != nil {
 		return lifecycleInternalError{kind: cancellation, destroy: isConnectionInterruption(err)}
 	}
@@ -1146,7 +1452,12 @@ func lifecycleMutationError(err error) error {
 			return securitystate.ErrDestinationLifecycleUnavailable
 		}
 	}
-	return securitystate.ErrDestinationLifecycleUnavailable
+	if singleCausePostgresError(err) {
+		return securitystate.ErrDestinationLifecycleUnavailable
+	}
+	return lifecycleInternalError{
+		kind: securitystate.ErrDestinationLifecycleOutcomeUnknown, destroy: true,
+	}
 }
 
 type lifecycleInternalError struct {
@@ -1159,8 +1470,14 @@ func (err lifecycleInternalError) Error() string {
 }
 
 func (err lifecycleInternalError) Is(target error) bool { return target == err.kind }
+func (err lifecycleInternalError) Unwrap() error        { return err.kind }
 
 func lifecycleReadError(ctx context.Context, err error) error {
+	if !lifecycleRepositorySingleCauseChain(err) {
+		return lifecycleInternalError{
+			kind: securitystate.ErrDestinationLifecycleUnavailable, destroy: true,
+		}
+	}
 	if cancellation := lifecycleRepositoryCancellation(ctx, err); cancellation != nil {
 		return lifecycleInternalError{kind: cancellation, destroy: isConnectionInterruption(err)}
 	}
@@ -1168,6 +1485,56 @@ func lifecycleReadError(ctx context.Context, err error) error {
 		kind:    securitystate.ErrDestinationLifecycleUnavailable,
 		destroy: isConnectionInterruption(err),
 	}
+}
+
+// lifecycleUnsafeOrConnectionInterruption guards every raw dependency error
+// before it may reach the generic PostgreSQL interruption detector. The
+// remaining direct detector calls in this file receive only an error already
+// checked by the same single-cause gate or a fixed/internal cause. The standard
+// errors traversal used by that detector is intentionally unbounded and follows
+// custom unwrap methods, so ambiguous, typed-nil, cyclic and over-deep graphs
+// must be treated as unsafe without traversing them again. Destroying the
+// connection is the fail-closed result.
+func lifecycleUnsafeOrConnectionInterruption(err error) bool {
+	if err == nil {
+		return false
+	}
+	if !lifecycleRepositorySingleCauseChain(err) {
+		return true
+	}
+	return isConnectionInterruption(err)
+}
+
+func lifecycleCombinedReadCause(primary, terminal error) error {
+	if primary == nil {
+		return terminal
+	}
+	if terminal == nil {
+		return primary
+	}
+	if lifecycleSameDirectReadCause(primary, terminal) {
+		return primary
+	}
+	return errors.Join(primary, terminal)
+}
+
+func lifecycleSameDirectReadCause(primary, terminal error) bool {
+	if nilInterface(primary) || nilInterface(terminal) {
+		return false
+	}
+	for _, candidate := range []error{primary, terminal} {
+		if _, customMatch := candidate.(interface{ Is(error) bool }); customMatch {
+			return false
+		}
+		if _, unwraps := candidate.(interface{ Unwrap() error }); unwraps {
+			return false
+		}
+		if _, unwrapsMany := candidate.(interface{ Unwrap() []error }); unwrapsMany {
+			return false
+		}
+	}
+	primaryType := reflect.TypeOf(primary)
+	return primaryType == reflect.TypeOf(terminal) && primaryType.Comparable() && primary == terminal
 }
 
 func lifecycleErrorRequiresDestroy(err error) bool {
@@ -1211,13 +1578,54 @@ func lifecycleConnectionError(ctx context.Context, err error, operation string) 
 }
 
 func lifecycleRepositoryCancellation(ctx context.Context, err error) error {
-	if errors.Is(err, context.Canceled) || (!nilInterface(ctx) && errors.Is(ctx.Err(), context.Canceled)) {
+	if err != nil {
+		if lifecycleRepositorySingleCauseMatches(err, context.Canceled) {
+			return securitystate.ErrDestinationLifecycleCanceled
+		}
+		if lifecycleRepositorySingleCauseMatches(err, context.DeadlineExceeded) {
+			return securitystate.ErrDestinationLifecycleDeadline
+		}
+		return nil
+	}
+	if !nilInterface(ctx) && ctx.Err() == context.Canceled {
 		return securitystate.ErrDestinationLifecycleCanceled
 	}
-	if errors.Is(err, context.DeadlineExceeded) || (!nilInterface(ctx) && errors.Is(ctx.Err(), context.DeadlineExceeded)) {
+	if !nilInterface(ctx) && ctx.Err() == context.DeadlineExceeded {
 		return securitystate.ErrDestinationLifecycleDeadline
 	}
 	return nil
+}
+
+func lifecycleRepositorySingleCauseMatches(err, target error) bool {
+	for current, depth := err, 0; current != nil && depth < 64; depth++ {
+		if nilInterface(current) {
+			return false
+		}
+		if _, ambiguous := current.(interface{ Unwrap() []error }); ambiguous {
+			return false
+		}
+		if reflect.TypeOf(current).Comparable() && current == target {
+			return true
+		}
+		current = errors.Unwrap(current)
+	}
+	return false
+}
+
+func lifecycleRepositorySingleCauseChain(err error) bool {
+	for current, depth := err, 0; current != nil && depth < 64; depth++ {
+		if nilInterface(current) {
+			return false
+		}
+		if _, ambiguous := current.(interface{ Unwrap() []error }); ambiguous {
+			return false
+		}
+		current = errors.Unwrap(current)
+		if current == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func lifecycleRepositoryError(kind error, operation string) error {

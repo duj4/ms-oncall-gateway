@@ -124,6 +124,7 @@ func TestDestinationTokenLifecyclePostgresIntegration(t *testing.T) {
 	if err != nil || initial.RecordID() != records[0] || initial.Token().IsZero() {
 		t.Fatal("destination lifecycle initial staged creation 失败")
 	}
+	initialToken := integrationLifecycleOpaqueToken(t, initial.Token())
 	assertIntegrationLifecycleStatus(t, ctx, service, audience, destination, securitystate.LifecycleStagedInitial)
 	concurrentIntegrationLifecycleOperation(t, []func() error{
 		func() error {
@@ -135,7 +136,9 @@ func TestDestinationTokenLifecyclePostgresIntegration(t *testing.T) {
 	})
 	assertIntegrationLifecycleResolution(t, ctx, pool, keySource, keyID, audience, initial.Token(), destination)
 
-	rotation, err := service.CreateStagedToken(ctx, audience, destination)
+	rotation, err := service.CreateRotationStagedToken(
+		ctx, audience, destination, initial.RecordID(), initialToken,
+	)
 	if err != nil || rotation.RecordID() != records[1] || rotation.Token().IsZero() {
 		t.Fatal("destination lifecycle rotation staged creation 失败")
 	}
@@ -176,19 +179,33 @@ func TestDestinationTokenLifecyclePostgresIntegration(t *testing.T) {
 	if !present {
 		t.Fatal("destination lifecycle current active record 缺失")
 	}
+	currentToken := initialToken
+	if currentActive.RecordID() == rotation.RecordID() {
+		currentToken = integrationLifecycleOpaqueToken(t, rotation.Token())
+	} else if currentActive.RecordID() != initial.RecordID() {
+		t.Fatal("destination lifecycle current active token identity unknown")
+	}
 
-	secondRotation, err := service.CreateStagedToken(ctx, audience, destination)
+	secondRotation, err := service.CreateRotationStagedToken(
+		ctx, audience, destination, currentActive.RecordID(), currentToken,
+	)
 	if err != nil || secondRotation.RecordID() != records[2] {
 		t.Fatal("destination lifecycle second rotation staged creation 失败")
 	}
-	if err := service.ActivateRotation(ctx, audience, destination, secondRotation.RecordID(), currentActive.RecordID()); err != nil {
+	if _, err := service.ActivateRotation(ctx, audience, destination, secondRotation.RecordID(), currentActive.RecordID()); err != nil {
 		t.Fatal("destination lifecycle second rotation activation 失败")
 	}
+	secondRotationToken := integrationLifecycleOpaqueToken(t, secondRotation.Token())
 	deadlineService := mustIntegrationLifecycleService(t, pool, keySource, &integrationLifecycleRecordGenerator{}, integrationLifecycleNow.Add(6*time.Hour), 0x40)
-	concurrentFinalizeAndStageIntegrationLifecycle(t, ctx, pool, keySource, deadlineService, audience, destination, secondRotation.RecordID(), currentActive.RecordID(), records[3])
+	concurrentFinalizeAndStageIntegrationLifecycle(
+		t, ctx, pool, keySource, deadlineService, audience, destination,
+		secondRotation.RecordID(), currentActive.RecordID(), secondRotationToken, records[3],
+	)
 	assertIntegrationLifecycleStatus(t, ctx, service, audience, destination, securitystate.LifecycleActive)
 
-	aborted, err := service.CreateStagedToken(ctx, audience, destination)
+	aborted, err := service.CreateRotationStagedToken(
+		ctx, audience, destination, secondRotation.RecordID(), secondRotationToken,
+	)
 	if err != nil || aborted.RecordID() != records[4] {
 		t.Fatal("destination lifecycle abort candidate creation 失败")
 	}
@@ -197,8 +214,14 @@ func TestDestinationTokenLifecyclePostgresIntegration(t *testing.T) {
 	}
 	assertIntegrationLifecycleStatus(t, ctx, service, audience, destination, securitystate.LifecycleActive)
 
-	concurrentStageIntegrationLifecycle(t, ctx, pool, keySource, audience, destination, records[5:7])
-	concurrentRollbackAndStageIntegrationLifecycle(t, ctx, pool, keySource, audience, destination, records[7], records[8])
+	concurrentStageIntegrationLifecycle(
+		t, ctx, pool, keySource, audience, destination,
+		secondRotation.RecordID(), secondRotationToken, records[5:7],
+	)
+	concurrentRollbackAndStageIntegrationLifecycle(
+		t, ctx, pool, keySource, audience, destination,
+		secondRotationToken, records[7], records[8],
+	)
 	if countIntegrationLifecycleLiveRows(t, ctx, pool) > 2 {
 		t.Fatal("destination lifecycle third-token prevention 失败")
 	}
@@ -247,6 +270,7 @@ func concurrentFinalizeAndStageIntegrationLifecycle(
 	destination securitystate.DestinationID,
 	newActive securitystate.DestinationTokenRecordID,
 	oldRetiring securitystate.DestinationTokenRecordID,
+	currentToken securitystate.OpaqueDestinationToken,
 	stageRecord securitystate.DestinationTokenRecordID,
 ) {
 	t.Helper()
@@ -269,7 +293,9 @@ func concurrentFinalizeAndStageIntegrationLifecycle(
 	}()
 	go func() {
 		<-start
-		created, err := stageService.CreateStagedToken(ctx, audience, destination)
+		created, err := stageService.CreateRotationStagedToken(
+			ctx, audience, destination, newActive, currentToken,
+		)
 		stageResult <- struct {
 			created securitystate.CreatedStagedToken
 			err     error
@@ -322,6 +348,18 @@ func mustIntegrationLifecycleService(
 	return service
 }
 
+func integrationLifecycleOpaqueToken(
+	t *testing.T,
+	token securitystate.OneTimeDestinationToken,
+) securitystate.OpaqueDestinationToken {
+	t.Helper()
+	parsed, err := securitystate.ParseOpaqueDestinationToken(token.Value())
+	if err != nil {
+		t.Fatal("destination lifecycle integration opaque token setup failed")
+	}
+	return parsed
+}
+
 func concurrentStageIntegrationLifecycle(
 	t *testing.T,
 	ctx context.Context,
@@ -329,6 +367,8 @@ func concurrentStageIntegrationLifecycle(
 	keys integrationLifecycleKeySource,
 	audience securitystate.GatewayAudienceID,
 	destination securitystate.DestinationID,
+	activeRecord securitystate.DestinationTokenRecordID,
+	currentToken securitystate.OpaqueDestinationToken,
 	records []securitystate.DestinationTokenRecordID,
 ) {
 	t.Helper()
@@ -345,7 +385,9 @@ func concurrentStageIntegrationLifecycle(
 		go func(current *securitystate.DestinationTokenLifecycleService) {
 			defer wait.Done()
 			<-start
-			created, err := current.CreateStagedToken(ctx, audience, destination)
+			created, err := current.CreateRotationStagedToken(
+				ctx, audience, destination, activeRecord, currentToken,
+			)
 			results <- created
 			errorsFound <- err
 		}(service)
@@ -388,6 +430,7 @@ func concurrentRollbackAndStageIntegrationLifecycle(
 	keys integrationLifecycleKeySource,
 	audience securitystate.GatewayAudienceID,
 	destination securitystate.DestinationID,
+	currentToken securitystate.OpaqueDestinationToken,
 	rotationRecord securitystate.DestinationTokenRecordID,
 	stageRecord securitystate.DestinationTokenRecordID,
 ) {
@@ -406,11 +449,13 @@ func concurrentRollbackAndStageIntegrationLifecycle(
 	if !present || before.Status() != securitystate.LifecycleActive {
 		t.Fatal("destination lifecycle rollback-stage setup state 无效")
 	}
-	rotation, err := setupService.CreateStagedToken(ctx, audience, destination)
+	rotation, err := setupService.CreateRotationStagedToken(
+		ctx, audience, destination, oldActive.RecordID(), currentToken,
+	)
 	if err != nil || rotation.RecordID() != rotationRecord || rotation.Token().IsZero() {
 		t.Fatal("destination lifecycle rollback-stage rotation creation 失败")
 	}
-	if err := setupService.ActivateRotation(ctx, audience, destination, rotationRecord, oldActive.RecordID()); err != nil {
+	if _, err := setupService.ActivateRotation(ctx, audience, destination, rotationRecord, oldActive.RecordID()); err != nil {
 		t.Fatal("destination lifecycle rollback-stage rotation activation 失败")
 	}
 
@@ -436,7 +481,9 @@ func concurrentRollbackAndStageIntegrationLifecycle(
 	}()
 	go func() {
 		<-start
-		created, createErr := stageService.CreateStagedToken(ctx, audience, destination)
+		created, createErr := stageService.CreateRotationStagedToken(
+			ctx, audience, destination, oldActive.RecordID(), currentToken,
+		)
 		stageResult <- struct {
 			created securitystate.CreatedStagedToken
 			err     error
