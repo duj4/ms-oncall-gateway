@@ -45,9 +45,13 @@ type destinationResolverQuery struct {
 type fakeDestinationResolverRow struct {
 	values []any
 	err    error
+	hook   func()
 }
 
 func (row fakeDestinationResolverRow) Scan(destinations ...any) error {
+	if row.hook != nil {
+		row.hook()
+	}
 	if row.err != nil {
 		return row.err
 	}
@@ -540,6 +544,159 @@ func TestDestinationResolverSQLIsBoundedAndNeverReceivesRawToken(t *testing.T) {
 	}
 }
 
+func TestDestinationRotationTokenIdentifierClassifiesExactRecordWithoutUsabilityFilter(t *testing.T) {
+	activeID := mustDestinationResolverKeyID(t, resolverTestOnlyActiveKeyID)
+	key := mustDestinationResolverKey(t, 0)
+	newRecord, err := securitystate.ParseDestinationTokenRecordID(resolverTestOnlySecondRecord)
+	if err != nil {
+		t.Fatal("rotation identifier new record setup failed")
+	}
+	oldRecord, err := securitystate.ParseDestinationTokenRecordID(resolverTestOnlyRecord)
+	if err != nil {
+		t.Fatal("rotation identifier old record setup failed")
+	}
+	thirdRecord, err := securitystate.ParseDestinationTokenRecordID("aaaaaaaa-bbbb-cccc-8ddd-eeeeeeeeeeee")
+	if err != nil {
+		t.Fatal("rotation identifier third record setup failed")
+	}
+	source := func() *fakeDestinationResolverKeySource {
+		return destinationResolverKeySource(map[string]destinationResolverKeyResponse{
+			activeID.Value(): {key: key},
+		})
+	}
+
+	for _, test := range []struct {
+		name   string
+		row    pgx.Row
+		mutate func(*fakeDestinationResolverRow)
+		want   securitystate.DestinationTokenRotationTokenIdentity
+	}{
+		{name: "new active", row: validDestinationResolverRow(t, activeID, key, securitystate.DestinationTokenActive, securitystate.DestinationEnabled), mutate: func(row *fakeDestinationResolverRow) {
+			row.values[1] = resolverTestOnlySecondRecord
+		}, want: securitystate.DestinationTokenRotationTokenNew},
+		{name: "old retiring after deadline", row: validDestinationResolverRow(t, activeID, key, securitystate.DestinationTokenRetiring, securitystate.DestinationEnabled), want: securitystate.DestinationTokenRotationTokenOld},
+		{name: "old revoked", row: validDestinationResolverRow(t, activeID, key, securitystate.DestinationTokenRevoked, securitystate.DestinationEnabled), want: securitystate.DestinationTokenRotationTokenOld},
+		{name: "old expired", row: validDestinationResolverRow(t, activeID, key, securitystate.DestinationTokenActive, securitystate.DestinationEnabled), mutate: func(row *fakeDestinationResolverRow) {
+			row.values[11] = pgtype.Timestamptz{Time: resolverTestOnlyNow, Valid: true}
+		}, want: securitystate.DestinationTokenRotationTokenOld},
+		{name: "third record", row: validDestinationResolverRow(t, activeID, key, securitystate.DestinationTokenActive, securitystate.DestinationEnabled), mutate: func(row *fakeDestinationResolverRow) {
+			row.values[1] = thirdRecord.String()
+		}, want: securitystate.DestinationTokenRotationTokenNeither},
+		{name: "unknown token", row: fakeDestinationResolverRow{err: pgx.ErrNoRows}, want: securitystate.DestinationTokenRotationTokenNeither},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			row := test.row
+			if test.mutate != nil {
+				typed := row.(fakeDestinationResolverRow)
+				test.mutate(&typed)
+				row = typed
+			}
+			resolver, connection, _ := destinationResolverWithRows(
+				t, source(), []securitystate.DestinationVerifierKeyID{activeID}, row,
+			)
+			identity, identifyErr := resolver.IdentifyRotationToken(
+				context.Background(), mustDestinationResolverAudience(t), mustDestinationResolverDestination(t),
+				mustDestinationResolverToken(t), newRecord, oldRecord,
+				resolverTestOnlyNow.Add(48*time.Hour),
+			)
+			if identifyErr != nil || identity != test.want || connection.releaseCalls != 1 ||
+				connection.destroyCalls != 0 || len(connection.queries) != 1 {
+				t.Fatal("rotation token exact-record classification mismatch")
+			}
+			query := connection.queries[0]
+			if query.sql != selectDestinationTokenSQL || len(query.args) != 3 {
+				t.Fatal("rotation token identifier did not reuse bounded resolver query")
+			}
+			for _, argument := range query.args {
+				if text, ok := argument.(string); ok && text == resolverTestOnlyTokenText {
+					t.Fatal("raw token reached rotation identifier SQL")
+				}
+			}
+		})
+	}
+}
+
+func TestDestinationRotationTokenIdentifierFailsClosed(t *testing.T) {
+	activeID := mustDestinationResolverKeyID(t, resolverTestOnlyActiveKeyID)
+	historicalID := mustDestinationResolverKeyID(t, resolverTestOnlyHistoricalKeyID)
+	activeKey := mustDestinationResolverKey(t, 0)
+	historicalKey := mustDestinationResolverKey(t, 64)
+	newRecord, _ := securitystate.ParseDestinationTokenRecordID(resolverTestOnlySecondRecord)
+	oldRecord, _ := securitystate.ParseDestinationTokenRecordID(resolverTestOnlyRecord)
+	private := errors.New(resolverTestOnlyPrivateMarker)
+
+	resolver, _, _ := destinationResolverWithRows(
+		t,
+		destinationResolverKeySource(map[string]destinationResolverKeyResponse{activeID.Value(): {key: activeKey}}),
+		[]securitystate.DestinationVerifierKeyID{activeID},
+		fakeDestinationResolverRow{err: errors.Join(pgx.ErrNoRows, private)},
+	)
+	identity, err := resolver.IdentifyRotationToken(
+		context.Background(), mustDestinationResolverAudience(t), mustDestinationResolverDestination(t),
+		mustDestinationResolverToken(t), newRecord, oldRecord, resolverTestOnlyNow,
+	)
+	if identity != 0 || !errors.Is(err, ErrDestinationResolverUnavailable) ||
+		errors.Is(err, private) || strings.Contains(err.Error(), resolverTestOnlyPrivateMarker) {
+		t.Fatal("ambiguous rotation token read did not fail closed")
+	}
+
+	concurrent, cancel := context.WithCancel(context.Background())
+	resolver, connection, _ := destinationResolverWithRows(
+		t,
+		destinationResolverKeySource(map[string]destinationResolverKeyResponse{activeID.Value(): {key: activeKey}}),
+		[]securitystate.DestinationVerifierKeyID{activeID},
+		fakeDestinationResolverRow{err: errors.Join(context.Canceled, private), hook: cancel},
+	)
+	identity, err = resolver.IdentifyRotationToken(
+		concurrent, mustDestinationResolverAudience(t), mustDestinationResolverDestination(t),
+		mustDestinationResolverToken(t), newRecord, oldRecord, resolverTestOnlyNow,
+	)
+	if identity != 0 || !errors.Is(err, ErrDestinationResolverUnavailable) ||
+		errors.Is(err, context.Canceled) || connection.releaseCalls != 0 || connection.destroyCalls != 1 {
+		t.Fatal("concurrent cancellation downgraded an ambiguous rotation token read")
+	}
+
+	rows := []pgx.Row{
+		validDestinationResolverRow(t, activeID, activeKey, securitystate.DestinationTokenActive, securitystate.DestinationEnabled),
+		validDestinationResolverRow(t, historicalID, historicalKey, securitystate.DestinationTokenRevoked, securitystate.DestinationEnabled),
+	}
+	resolver, connection, _ = destinationResolverWithRows(
+		t,
+		destinationResolverKeySource(map[string]destinationResolverKeyResponse{
+			activeID.Value(): {key: activeKey}, historicalID.Value(): {key: historicalKey},
+		}),
+		[]securitystate.DestinationVerifierKeyID{activeID, historicalID}, rows...,
+	)
+	identity, err = resolver.IdentifyRotationToken(
+		context.Background(), mustDestinationResolverAudience(t), mustDestinationResolverDestination(t),
+		mustDestinationResolverToken(t), newRecord, oldRecord, resolverTestOnlyNow,
+	)
+	if identity != 0 || !errors.Is(err, ErrDestinationResolverIntegrity) ||
+		len(connection.queries) != 2 || connection.releaseCalls != 1 {
+		t.Fatal("multiple rotation token matches were accepted")
+	}
+
+	acquireCalls := 0
+	resolver, err = newOpaqueDestinationResolver(
+		func(context.Context) (destinationResolverConnection, error) {
+			acquireCalls++
+			return nil, private
+		},
+		destinationResolverKeySource(map[string]destinationResolverKeyResponse{activeID.Value(): {key: activeKey}}),
+		[]securitystate.DestinationVerifierKeyID{activeID},
+	)
+	if err != nil {
+		t.Fatal("rotation identifier validation fixture failed")
+	}
+	identity, err = resolver.IdentifyRotationToken(
+		context.Background(), mustDestinationResolverAudience(t), mustDestinationResolverDestination(t),
+		mustDestinationResolverToken(t), oldRecord, oldRecord, resolverTestOnlyNow,
+	)
+	if identity != 0 || !errors.Is(err, ErrDestinationResolverIntegrity) || acquireCalls != 0 {
+		t.Fatal("invalid rotation identity pair reached a dependency")
+	}
+}
+
 func TestDestinationResolverRejectsCorruptedRecords(t *testing.T) {
 	activeID := mustDestinationResolverKeyID(t, resolverTestOnlyActiveKeyID)
 	key := mustDestinationResolverKey(t, 0)
@@ -792,11 +949,14 @@ func TestDestinationResolverCancellationAndInvalidInputsStopEarly(t *testing.T) 
 	}
 
 	t.Run("key source cancellation", func(t *testing.T) {
-		for _, sourceErr := range []error{
-			context.Canceled,
-			errors.Join(context.DeadlineExceeded, private),
+		for _, test := range []struct {
+			sourceErr error
+			want      error
+		}{
+			{sourceErr: context.Canceled, want: context.Canceled},
+			{sourceErr: errors.Join(context.DeadlineExceeded, private), want: ErrDestinationResolverUnavailable},
 		} {
-			source := destinationResolverKeySource(map[string]destinationResolverKeyResponse{activeID.Value(): {err: sourceErr}})
+			source := destinationResolverKeySource(map[string]destinationResolverKeyResponse{activeID.Value(): {err: test.sourceErr}})
 			resolver, err := newOpaqueDestinationResolver(func(context.Context) (destinationResolverConnection, error) {
 				t.Fatal("canceled key lookup reached PostgreSQL")
 				return nil, nil
@@ -805,11 +965,7 @@ func TestDestinationResolverCancellationAndInvalidInputsStopEarly(t *testing.T) 
 				t.Fatal("canceled-key fixture construction failed")
 			}
 			destination, resolveErr := resolver.Resolve(context.Background(), mustDestinationResolverAudience(t), mustDestinationResolverToken(t), resolverTestOnlyNow)
-			want := context.Canceled
-			if errors.Is(sourceErr, context.DeadlineExceeded) {
-				want = context.DeadlineExceeded
-			}
-			assertDestinationResolverSafeError(t, destination, resolveErr, want, private)
+			assertDestinationResolverSafeError(t, destination, resolveErr, test.want, private)
 		}
 	})
 }

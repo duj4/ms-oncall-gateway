@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -21,6 +22,7 @@ const (
 	lifecyclePGTestDestination = "66666666-7777-8888-8999-aaaaaaaaaaaa"
 	lifecyclePGTestRecordOne   = "88888888-9999-aaaa-8bbb-cccccccccccc"
 	lifecyclePGTestRecordTwo   = "99999999-aaaa-bbbb-8ccc-dddddddddddd"
+	lifecyclePGTestRecordThree = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 	lifecyclePGTestKeyID       = "lifecycle-postgres-test-key"
 	lifecyclePGPrivateMarker   = "lifecycle-postgres-private-marker"
 )
@@ -30,6 +32,7 @@ var lifecyclePGNow = time.Date(2031, time.February, 3, 4, 5, 6, 0, time.UTC)
 type lifecyclePGRow struct {
 	values []any
 	err    error
+	hook   func()
 }
 
 type lifecyclePGTypedNilRow struct{}
@@ -39,6 +42,9 @@ func (*lifecyclePGTypedNilRow) Scan(...any) error {
 }
 
 func (row lifecyclePGRow) Scan(destinations ...any) error {
+	if row.hook != nil {
+		row.hook()
+	}
 	if row.err != nil {
 		return row.err
 	}
@@ -60,13 +66,42 @@ func (row lifecyclePGRow) Scan(destinations ...any) error {
 }
 
 type lifecyclePGRows struct {
-	values [][]any
-	err    error
-	index  int
-	closed bool
+	values         [][]any
+	err            error
+	scanErr        error
+	index          int
+	closed         bool
+	errCalls       int
+	errBeforeClose bool
+	closeHook      func()
+	errHook        func()
 }
 
 type lifecyclePGTypedNilRows struct{}
+
+type lifecyclePGLeafError string
+
+func (err lifecyclePGLeafError) Error() string { return string(err) }
+
+type lifecyclePGCustomIsError struct{ target error }
+
+func (lifecyclePGCustomIsError) Error() string { return "lifecycle custom match error" }
+func (err lifecyclePGCustomIsError) Is(target error) bool {
+	return target == err.target
+}
+
+type lifecyclePGUncomparableError []byte
+
+func (lifecyclePGUncomparableError) Error() string { return "lifecycle uncomparable error" }
+
+type lifecyclePGTypedNilError struct{}
+
+func (*lifecyclePGTypedNilError) Error() string { return "lifecycle typed nil error" }
+
+type lifecyclePGCyclicError struct{ next error }
+
+func (*lifecyclePGCyclicError) Error() string     { return "lifecycle cyclic error" }
+func (err *lifecyclePGCyclicError) Unwrap() error { return err.next }
 
 func (*lifecyclePGTypedNilRows) Close()     {}
 func (*lifecyclePGTypedNilRows) Err() error { return nil }
@@ -75,12 +110,30 @@ func (*lifecyclePGTypedNilRows) Scan(...any) error {
 	panic("typed-nil lifecycle rows must not be scanned")
 }
 
-func (rows *lifecyclePGRows) Close()     { rows.closed = true }
-func (rows *lifecyclePGRows) Err() error { return rows.err }
+func (rows *lifecyclePGRows) Close() {
+	rows.closed = true
+	if rows.closeHook != nil {
+		rows.closeHook()
+	}
+}
+func (rows *lifecyclePGRows) Err() error {
+	rows.errCalls++
+	if !rows.closed {
+		rows.errBeforeClose = true
+	}
+	if rows.errHook != nil {
+		rows.errHook()
+	}
+	return rows.err
+}
 func (rows *lifecyclePGRows) Next() bool { return rows.index < len(rows.values) }
 func (rows *lifecyclePGRows) Scan(destinations ...any) error {
 	if rows.index >= len(rows.values) {
 		return errors.New("lifecycle fake rows exhausted")
+	}
+	if rows.scanErr != nil {
+		rows.index++
+		return rows.scanErr
 	}
 	err := (lifecyclePGRow{values: rows.values[rows.index]}).Scan(destinations...)
 	rows.index++
@@ -96,12 +149,17 @@ type lifecyclePGCall struct {
 type lifecyclePGTransaction struct {
 	destinationRow pgx.Row
 	tokenRows      destinationTokenLifecycleRows
+	tokenRowSets   []destinationTokenLifecycleRows
 	queryErr       error
+	queryErrors    []error
 	execTags       []pgconn.CommandTag
 	execErrors     []error
+	execHook       func()
 	commitErr      error
+	commitHook     func()
 	rollbackErr    error
 	rollbackWait   bool
+	rollbackHook   func()
 	calls          []lifecyclePGCall
 	commitCalls    int
 	rollbackCalls  int
@@ -114,7 +172,20 @@ func (transaction *lifecyclePGTransaction) QueryRow(_ context.Context, sql strin
 }
 
 func (transaction *lifecyclePGTransaction) Query(_ context.Context, sql string, args ...any) (destinationTokenLifecycleRows, error) {
+	queryIndex := 0
+	for _, call := range transaction.calls {
+		if call.kind == "query" {
+			queryIndex++
+		}
+	}
 	transaction.calls = append(transaction.calls, lifecyclePGCall{kind: "query", sql: sql, args: append([]any(nil), args...)})
+	if queryIndex < len(transaction.tokenRowSets) {
+		var err error
+		if queryIndex < len(transaction.queryErrors) {
+			err = transaction.queryErrors[queryIndex]
+		}
+		return transaction.tokenRowSets[queryIndex], err
+	}
 	return transaction.tokenRows, transaction.queryErr
 }
 
@@ -134,7 +205,13 @@ func (transaction *lifecyclePGTransaction) Exec(_ context.Context, sql string, a
 		tag = pgconn.NewCommandTag("UPDATE 1")
 	}
 	if index < len(transaction.execErrors) {
+		if transaction.execHook != nil {
+			transaction.execHook()
+		}
 		return tag, transaction.execErrors[index]
+	}
+	if transaction.execHook != nil {
+		transaction.execHook()
 	}
 	return tag, nil
 }
@@ -142,6 +219,9 @@ func (transaction *lifecyclePGTransaction) Exec(_ context.Context, sql string, a
 func (transaction *lifecyclePGTransaction) Commit(context.Context) error {
 	transaction.calls = append(transaction.calls, lifecyclePGCall{kind: "commit"})
 	transaction.commitCalls++
+	if transaction.commitHook != nil {
+		transaction.commitHook()
+	}
 	return transaction.commitErr
 }
 
@@ -149,6 +229,9 @@ func (transaction *lifecyclePGTransaction) Rollback(ctx context.Context) error {
 	transaction.calls = append(transaction.calls, lifecyclePGCall{kind: "rollback"})
 	transaction.rollbackCalls++
 	_, transaction.rollbackBound = ctx.Deadline()
+	if transaction.rollbackHook != nil {
+		transaction.rollbackHook()
+	}
 	if transaction.rollbackWait {
 		<-ctx.Done()
 		return ctx.Err()
@@ -159,6 +242,7 @@ func (transaction *lifecyclePGTransaction) Rollback(ctx context.Context) error {
 type lifecyclePGConnection struct {
 	transaction destinationTokenLifecycleTransaction
 	beginErr    error
+	beginHook   func()
 	beginCalls  int
 	options     []pgx.TxOptions
 	releases    int
@@ -168,6 +252,9 @@ type lifecyclePGConnection struct {
 func (connection *lifecyclePGConnection) Begin(_ context.Context, options pgx.TxOptions) (destinationTokenLifecycleTransaction, error) {
 	connection.beginCalls++
 	connection.options = append(connection.options, options)
+	if connection.beginHook != nil {
+		connection.beginHook()
+	}
 	return connection.transaction, connection.beginErr
 }
 func (connection *lifecyclePGConnection) Release() { connection.releases++ }
@@ -241,6 +328,92 @@ func lifecyclePGTokenValues(record, state string, stateChanged time.Time) []any 
 	}
 }
 
+func lifecyclePGRotationAttemptRows(state string) (live [][]any, exact [][]any) {
+	rotationStarted := lifecyclePGNow.Add(-time.Minute)
+	newCreated := lifecyclePGNow.Add(-2 * time.Hour)
+	oldCreated := lifecyclePGNow.Add(-4 * time.Hour)
+	newActivated := rotationStarted
+	oldActivated := lifecyclePGNow.Add(-3 * time.Hour)
+	deadline := lifecyclePGNow.Add(6 * time.Hour)
+	newState := "active"
+	oldState := "retiring"
+	newStateChanged := rotationStarted
+	oldStateChanged := rotationStarted
+	newRevoked := time.Time{}
+	oldRevoked := time.Time{}
+	oldRetirementStarted := rotationStarted
+
+	switch state {
+	case "rolled-back":
+		rollbackAt := lifecyclePGNow.Add(-30 * time.Second)
+		newState = "revoked"
+		oldState = "active"
+		newRevoked = rollbackAt
+		newStateChanged = rollbackAt
+		oldStateChanged = rollbackAt
+		oldRetirementStarted = time.Time{}
+		deadline = time.Time{}
+	case "completed":
+		rotationStarted = lifecyclePGNow.Add(-2 * time.Hour)
+		newCreated = lifecyclePGNow.Add(-3 * time.Hour)
+		oldActivated = lifecyclePGNow.Add(-3 * time.Hour)
+		newActivated = rotationStarted
+		newStateChanged = rotationStarted
+		oldRetirementStarted = rotationStarted
+		deadline = lifecyclePGNow.Add(-time.Hour)
+		oldState = "revoked"
+		oldRevoked = lifecyclePGNow.Add(-30 * time.Minute)
+		oldStateChanged = oldRevoked
+	}
+
+	newToken := lifecyclePGExactTokenValues(
+		lifecyclePGTestRecordTwo, newState, newCreated, newActivated,
+		time.Time{}, time.Time{}, newRevoked, newStateChanged,
+	)
+	oldToken := lifecyclePGExactTokenValues(
+		lifecyclePGTestRecordOne, oldState, oldCreated, oldActivated,
+		oldRetirementStarted, deadline, oldRevoked, oldStateChanged,
+	)
+	exact = [][]any{newToken, oldToken}
+	switch state {
+	case "rolled-back":
+		live = [][]any{oldToken}
+	case "completed":
+		live = [][]any{newToken}
+	default:
+		live = [][]any{newToken, oldToken}
+	}
+	return live, exact
+}
+
+func lifecyclePGExactTokenValues(
+	record, state string,
+	createdAt, activatedAt, retirementStartedAt, retirementDeadline, revokedAt, stateChangedAt time.Time,
+) []any {
+	optional := func(value time.Time) pgtype.Timestamptz {
+		if value.IsZero() {
+			return pgtype.Timestamptz{}
+		}
+		return pgtype.Timestamptz{Time: value, Valid: true}
+	}
+	return []any{
+		record,
+		lifecyclePGTestAudience,
+		lifecyclePGTestDestination,
+		make([]byte, 32),
+		lifecyclePGTestKeyID,
+		state,
+		pgtype.Timestamptz{Time: createdAt, Valid: true},
+		optional(activatedAt),
+		optional(retirementStartedAt),
+		optional(revokedAt),
+		pgtype.Timestamptz{Time: lifecyclePGNow.Add(48 * time.Hour), Valid: true},
+		pgtype.Timestamptz{Time: createdAt.Add(12 * time.Hour), Valid: true},
+		optional(retirementDeadline),
+		pgtype.Timestamptz{Time: stateChangedAt, Valid: true},
+	}
+}
+
 func lifecyclePGTransactionFor(tokens ...[]any) *lifecyclePGTransaction {
 	return &lifecyclePGTransaction{
 		destinationRow: lifecyclePGRow{values: lifecyclePGDestinationValues()},
@@ -249,6 +422,10 @@ func lifecyclePGTransactionFor(tokens ...[]any) *lifecyclePGTransaction {
 }
 
 func lifecyclePGCandidate(t *testing.T) securitystate.StagedTokenCandidate {
+	return lifecyclePGCandidateForRecord(t, lifecyclePGTestRecordOne)
+}
+
+func lifecyclePGCandidateForRecord(t *testing.T, record string) securitystate.StagedTokenCandidate {
 	t.Helper()
 	verifier, err := securitystate.NewTokenVerifier(make([]byte, 32))
 	if err != nil {
@@ -259,13 +436,28 @@ func lifecyclePGCandidate(t *testing.T) securitystate.StagedTokenCandidate {
 		t.Fatal("lifecycle postgres key setup failed")
 	}
 	candidate, err := securitystate.NewStagedTokenCandidate(
-		lifecyclePGAudience(t), lifecyclePGDestination(t), lifecyclePGRecord(t, lifecyclePGTestRecordOne),
+		lifecyclePGAudience(t), lifecyclePGDestination(t), lifecyclePGRecord(t, record),
 		verifier, keyID, lifecyclePGNow, lifecyclePGNow.Add(48*time.Hour), lifecyclePGNow.Add(12*time.Hour),
 	)
 	if err != nil {
 		t.Fatal("lifecycle postgres candidate setup failed")
 	}
 	return candidate
+}
+
+func lifecyclePGRotationCreateCommand(
+	t *testing.T,
+	candidate securitystate.StagedTokenCandidate,
+	expectedActive string,
+) securitystate.CreateRotationStagedTokenCommand {
+	t.Helper()
+	command, err := securitystate.NewCreateRotationStagedTokenCommand(
+		candidate, lifecyclePGRecord(t, expectedActive), lifecyclePGNow,
+	)
+	if err != nil {
+		t.Fatal("lifecycle postgres rotation create command setup failed")
+	}
+	return command
 }
 
 func assertLifecyclePGSafe(t *testing.T, err, want, private error) {
@@ -311,6 +503,127 @@ func TestDestinationTokenLifecycleCreateLocksBeforeInsert(t *testing.T) {
 		if text, ok := argument.(string); ok && strings.HasPrefix(text, "mso1_") {
 			t.Fatal("raw lifecycle token reached SQL")
 		}
+	}
+	expectedVerifier := candidate.Verifier().Bytes()
+	verifier, ok := insert.args[3].([]byte)
+	if !ok || !bytes.Equal(verifier, expectedVerifier[:]) {
+		t.Fatal("lifecycle staged insert did not persist only the generated verifier")
+	}
+	for index, argument := range insert.args {
+		if _, binary := argument.([]byte); binary && index != 3 {
+			t.Fatal("lifecycle staged insert carried unexpected binary token material")
+		}
+	}
+}
+
+func TestDestinationTokenLifecycleRotationCreateLocksAndBindsExpectedActive(t *testing.T) {
+	active := lifecyclePGTokenValues(
+		lifecyclePGTestRecordTwo, "active", lifecyclePGNow.Add(-time.Minute),
+	)
+	transaction := lifecyclePGTransactionFor(active)
+	repository, connection, acquires := lifecyclePGRepository(transaction)
+	candidate := lifecyclePGCandidate(t)
+	command := lifecyclePGRotationCreateCommand(t, candidate, lifecyclePGTestRecordTwo)
+
+	if err := repository.CreateRotationStagedToken(context.Background(), command); err != nil {
+		t.Fatal("lifecycle postgres rotation staged insert failed")
+	}
+	if *acquires != 1 || connection.beginCalls != 1 || connection.releases != 1 ||
+		connection.destroys != 0 || transaction.commitCalls != 1 || transaction.rollbackCalls != 0 {
+		t.Fatal("lifecycle postgres rotation staged transaction lifecycle mismatch")
+	}
+	if len(transaction.calls) != 4 || transaction.calls[0].sql != lockLifecycleDestinationSQL ||
+		transaction.calls[1].sql != lockLifecycleTokensSQL ||
+		transaction.calls[2].sql != insertLifecycleStagedTokenSQL ||
+		transaction.calls[3].kind != "commit" {
+		t.Fatal("lifecycle rotation staged insert did not validate locked state before insert")
+	}
+	insert := transaction.calls[2]
+	if len(insert.args) != 8 || insert.args[0] != lifecyclePGTestRecordOne ||
+		insert.args[1] != lifecyclePGTestAudience || insert.args[2] != lifecyclePGTestDestination {
+		t.Fatal("lifecycle rotation staged insert arguments mismatch")
+	}
+	for _, argument := range insert.args {
+		if text, ok := argument.(string); ok && strings.HasPrefix(text, "mso1_") {
+			t.Fatal("raw lifecycle rotation token reached SQL")
+		}
+	}
+	expectedVerifier := candidate.Verifier().Bytes()
+	verifier, ok := insert.args[3].([]byte)
+	if !ok || !bytes.Equal(verifier, expectedVerifier[:]) {
+		t.Fatal("lifecycle rotation staged insert did not persist only the generated verifier")
+	}
+	for index, argument := range insert.args {
+		if _, binary := argument.([]byte); binary && index != 3 {
+			t.Fatal("lifecycle rotation staged insert carried unexpected binary token material")
+		}
+	}
+}
+
+func TestDestinationTokenLifecycleRotationCreateRejectsStaleExpectedActive(t *testing.T) {
+	active := lifecyclePGTokenValues(
+		lifecyclePGTestRecordTwo, "active", lifecyclePGNow.Add(-time.Minute),
+	)
+	transaction := lifecyclePGTransactionFor(active)
+	repository, connection, _ := lifecyclePGRepository(transaction)
+	command := lifecyclePGRotationCreateCommand(
+		t, lifecyclePGCandidate(t), lifecyclePGTestRecordThree,
+	)
+
+	err := repository.CreateRotationStagedToken(context.Background(), command)
+	assertLifecyclePGSafe(t, err, securitystate.ErrDestinationLifecycleConflict, nil)
+	if transaction.commitCalls != 0 || transaction.rollbackCalls != 1 ||
+		connection.releases != 1 || connection.destroys != 0 {
+		t.Fatal("stale expected-active rotation create transaction boundary mismatch")
+	}
+	for _, call := range transaction.calls {
+		if call.kind == "exec" {
+			t.Fatal("stale expected-active rotation create reached insert")
+		}
+	}
+}
+
+func TestDestinationTokenLifecycleGenericCreateCannotBypassRotationFence(t *testing.T) {
+	active := lifecyclePGTokenValues(
+		lifecyclePGTestRecordTwo, "active", lifecyclePGNow.Add(-time.Minute),
+	)
+	transaction := lifecyclePGTransactionFor(active)
+	repository, _, _ := lifecyclePGRepository(transaction)
+
+	err := repository.CreateStagedToken(
+		context.Background(), lifecyclePGCandidate(t), lifecyclePGNow,
+	)
+	assertLifecyclePGSafe(t, err, securitystate.ErrDestinationLifecycleConflict, nil)
+	for _, call := range transaction.calls {
+		if call.kind == "exec" {
+			t.Fatal("generic staged create bypassed the expected-active rotation fence")
+		}
+	}
+}
+
+func TestDestinationTokenLifecycleRotationCreateOutcomeUnknownIsNotRetried(t *testing.T) {
+	private := errors.New(lifecyclePGPrivateMarker)
+	active := lifecyclePGTokenValues(
+		lifecyclePGTestRecordTwo, "active", lifecyclePGNow.Add(-time.Minute),
+	)
+	transaction := lifecyclePGTransactionFor(active)
+	transaction.execErrors = []error{private}
+	repository, connection, _ := lifecyclePGRepository(transaction)
+	command := lifecyclePGRotationCreateCommand(
+		t, lifecyclePGCandidate(t), lifecyclePGTestRecordTwo,
+	)
+
+	err := repository.CreateRotationStagedToken(context.Background(), command)
+	assertLifecyclePGSafe(t, err, securitystate.ErrDestinationLifecycleOutcomeUnknown, private)
+	execCalls := 0
+	for _, call := range transaction.calls {
+		if call.kind == "exec" {
+			execCalls++
+		}
+	}
+	if execCalls != 1 || transaction.commitCalls != 0 || transaction.rollbackCalls != 1 ||
+		connection.destroys != 1 || connection.releases != 0 {
+		t.Fatal("rotation staged insert ambiguity was retried or reused its connection")
 	}
 }
 
@@ -408,12 +721,14 @@ func TestDestinationTokenLifecycleTransitionSQLAndDeadlineBoundaries(t *testing.
 		lifecyclePGTokenValues(lifecyclePGTestRecordOne, "retiring", lifecyclePGNow.Add(-time.Minute)),
 	}
 	for _, test := range []struct {
-		name   string
-		now    time.Time
-		reason securitystate.RotationCompletionReason
-		want   error
+		name       string
+		now        time.Time
+		reason     securitystate.RotationCompletionReason
+		want       error
+		noMutation bool
 	}{
-		{name: "rollback at deadline", now: lifecyclePGNow.Add(6 * time.Hour), want: securitystate.ErrDestinationLifecycleConflict},
+		{name: "rollback at deadline", now: lifecyclePGNow.Add(6 * time.Hour), want: securitystate.ErrDestinationLifecycleConflict, noMutation: true},
+		{name: "rollback after deadline", now: lifecyclePGNow.Add(6*time.Hour + time.Microsecond), want: securitystate.ErrDestinationLifecycleConflict, noMutation: true},
 		{name: "deadline finalize before", now: lifecyclePGNow, reason: securitystate.RotationDeadlineElapsed, want: securitystate.ErrDestinationLifecycleConflict},
 		{name: "deadline finalize exact", now: lifecyclePGNow.Add(6 * time.Hour), reason: securitystate.RotationDeadlineElapsed},
 	} {
@@ -429,8 +744,19 @@ func TestDestinationTokenLifecycleTransitionSQLAndDeadlineBoundaries(t *testing.
 			if test.want == nil && err != nil || test.want != nil && !errors.Is(err, test.want) {
 				t.Fatal("lifecycle deadline boundary mismatch")
 			}
+			if test.noMutation {
+				for _, call := range transaction.calls {
+					if call.kind == "exec" {
+						t.Fatal("rollback at or after its recorded deadline reached a mutation")
+					}
+				}
+				if transaction.commitCalls != 0 || transaction.rollbackCalls != 1 {
+					t.Fatal("deadline-rejected rollback transaction boundary mismatch")
+				}
+			}
 		})
 	}
+
 }
 
 func TestDestinationTokenLifecycleRotationRequiresFullOverlapCoverage(t *testing.T) {
@@ -509,6 +835,388 @@ func TestDestinationTokenLifecycleInspectionUsesConsistentReadAndNoMutation(t *t
 		if call.kind == "exec" {
 			t.Fatal("lifecycle inspection performed a mutation")
 		}
+	}
+}
+
+func TestDestinationTokenRotationAttemptInspectionProvesExactPairAndTerminals(t *testing.T) {
+	newID := lifecyclePGRecord(t, lifecyclePGTestRecordTwo)
+	oldID := lifecyclePGRecord(t, lifecyclePGTestRecordOne)
+	for _, test := range []struct {
+		name       string
+		state      string
+		now        time.Time
+		wantStatus securitystate.DestinationLifecycleStatus
+		wantNew    securitystate.DestinationTokenState
+		wantOld    securitystate.DestinationTokenState
+	}{
+		{name: "active retiring pair", state: "pair", now: lifecyclePGNow, wantStatus: securitystate.LifecycleActiveWithRetiring, wantNew: securitystate.DestinationTokenActive, wantOld: securitystate.DestinationTokenRetiring},
+		{name: "deadline elapsed pair", state: "pair", now: lifecyclePGNow.Add(7 * time.Hour), wantStatus: securitystate.LifecycleReconciliationRequired, wantNew: securitystate.DestinationTokenActive, wantOld: securitystate.DestinationTokenRetiring},
+		{name: "rolled back terminal", state: "rolled-back", now: lifecyclePGNow, wantStatus: securitystate.LifecycleActive, wantNew: securitystate.DestinationTokenRevoked, wantOld: securitystate.DestinationTokenActive},
+		{name: "completed terminal", state: "completed", now: lifecyclePGNow, wantStatus: securitystate.LifecycleActive, wantNew: securitystate.DestinationTokenActive, wantOld: securitystate.DestinationTokenRevoked},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			live, exact := lifecyclePGRotationAttemptRows(test.state)
+			events := make([]string, 0, 3)
+			exactRows := &lifecyclePGRows{values: exact}
+			exactRows.closeHook = func() { events = append(events, "close") }
+			exactRows.errHook = func() { events = append(events, "err") }
+			transaction := &lifecyclePGTransaction{
+				destinationRow: lifecyclePGRow{values: lifecyclePGDestinationValues()},
+				tokenRowSets: []destinationTokenLifecycleRows{
+					&lifecyclePGRows{values: live},
+					exactRows,
+				},
+			}
+			transaction.commitHook = func() { events = append(events, "commit") }
+			repository, connection, acquires := lifecyclePGRepository(transaction)
+			snapshot, err := repository.InspectRotationAttempt(
+				context.Background(), lifecyclePGAudience(t), lifecyclePGDestination(t),
+				newID, oldID, test.now,
+			)
+			if err != nil || snapshot.Lifecycle().Status() != test.wantStatus ||
+				snapshot.NewToken().RecordID() != newID || snapshot.NewToken().State() != test.wantNew ||
+				snapshot.OldToken().RecordID() != oldID || snapshot.OldToken().State() != test.wantOld {
+				t.Fatal("exact rotation attempt snapshot mismatch")
+			}
+			if *acquires != 1 || connection.beginCalls != 1 || connection.releases != 1 ||
+				connection.destroys != 0 || transaction.commitCalls != 1 || transaction.rollbackCalls != 0 ||
+				len(connection.options) != 1 || connection.options[0].IsoLevel != pgx.RepeatableRead ||
+				connection.options[0].AccessMode != pgx.ReadOnly {
+				t.Fatal("rotation attempt inspection transaction boundary mismatch")
+			}
+			if len(transaction.calls) != 4 || transaction.calls[0].sql != inspectLifecycleDestinationSQL ||
+				transaction.calls[1].sql != inspectLifecycleTokensSQL ||
+				transaction.calls[2].sql != inspectRotationAttemptTokensSQL ||
+				transaction.calls[3].kind != "commit" {
+				t.Fatal("rotation attempt inspection did not use one consistent complete snapshot")
+			}
+			if !reflect.DeepEqual(events, []string{"close", "err", "commit"}) ||
+				exactRows.errCalls != 1 || exactRows.errBeforeClose {
+				t.Fatal("rotation attempt rows were not closed and checked before commit")
+			}
+			exactCall := transaction.calls[2]
+			if len(exactCall.args) != 4 || exactCall.args[0] != lifecyclePGTestAudience ||
+				exactCall.args[1] != lifecyclePGTestDestination || exactCall.args[2] != lifecyclePGTestRecordTwo ||
+				exactCall.args[3] != lifecyclePGTestRecordOne ||
+				strings.Contains(exactCall.sql, "token_state is distinct from 'revoked'") {
+				t.Fatal("rotation attempt exact-record query omitted a terminal counterpart")
+			}
+			if fmt.Sprintf("%+v", snapshot) != "[redacted]" {
+				t.Fatal("rotation attempt snapshot formatting exposed state")
+			}
+		})
+	}
+}
+
+func TestDestinationTokenRotationAttemptInspectionFailsClosedWithoutExactCounterpart(t *testing.T) {
+	live, exact := lifecyclePGRotationAttemptRows("completed")
+	exact = exact[:1]
+	transaction := &lifecyclePGTransaction{
+		destinationRow: lifecyclePGRow{values: lifecyclePGDestinationValues()},
+		tokenRowSets: []destinationTokenLifecycleRows{
+			&lifecyclePGRows{values: live},
+			&lifecyclePGRows{values: exact},
+		},
+	}
+	repository, connection, _ := lifecyclePGRepository(transaction)
+	snapshot, err := repository.InspectRotationAttempt(
+		context.Background(), lifecyclePGAudience(t), lifecyclePGDestination(t),
+		lifecyclePGRecord(t, lifecyclePGTestRecordTwo), lifecyclePGRecord(t, lifecyclePGTestRecordOne),
+		lifecyclePGNow,
+	)
+	if snapshot.Lifecycle().Status() != 0 || !errors.Is(err, securitystate.ErrDestinationLifecycleConflict) ||
+		transaction.commitCalls != 0 || transaction.rollbackCalls != 1 ||
+		connection.releases != 1 || connection.destroys != 0 {
+		t.Fatal("missing terminal counterpart was not rejected safely")
+	}
+	for _, call := range transaction.calls {
+		if call.kind == "exec" {
+			t.Fatal("rotation attempt inspection performed a mutation")
+		}
+	}
+}
+
+func TestDestinationTokenRotationAttemptInspectionClosesRowsBeforeRollback(t *testing.T) {
+	newID := lifecyclePGRecord(t, lifecyclePGTestRecordTwo)
+	oldID := lifecyclePGRecord(t, lifecyclePGTestRecordOne)
+	private := errors.New(lifecyclePGPrivateMarker)
+	thirdRow := func(exact [][]any) [][]any {
+		return append(exact, append([]any(nil), exact[0]...))
+	}
+	unchanged := func(exact [][]any) [][]any { return exact }
+	for _, test := range []struct {
+		name     string
+		mutate   func([][]any) [][]any
+		queryErr error
+		rowsErr  error
+		want     error
+		destroy  bool
+	}{
+		{name: "query error with rows", mutate: unchanged, queryErr: private, want: securitystate.ErrDestinationLifecycleUnavailable},
+		{name: "duplicate query cancellation", mutate: unchanged, queryErr: context.Canceled, rowsErr: context.Canceled, want: securitystate.ErrDestinationLifecycleCanceled, destroy: true},
+		{name: "third exact row", mutate: thirdRow, want: securitystate.ErrDestinationLifecycleReconciliation},
+		{name: "third exact row with close error", mutate: thirdRow, rowsErr: private, want: securitystate.ErrDestinationLifecycleUnavailable, destroy: true},
+		{name: "token decode error", mutate: func(exact [][]any) [][]any {
+			exact[0][0] = "invalid-record-id"
+			return exact
+		}, want: securitystate.ErrDestinationLifecycleReconciliation},
+		{name: "token constructor error", mutate: func(exact [][]any) [][]any {
+			createdAt := exact[0][6].(pgtype.Timestamptz).Time
+			exact[0][7] = pgtype.Timestamptz{Time: createdAt.Add(-time.Microsecond), Valid: true}
+			return exact
+		}, want: securitystate.ErrDestinationLifecycleReconciliation},
+		{name: "attempt constructor error", mutate: func(exact [][]any) [][]any {
+			createdAt := lifecyclePGNow.Add(time.Minute)
+			activatedAt := createdAt.Add(time.Minute)
+			exact[0][6] = pgtype.Timestamptz{Time: createdAt, Valid: true}
+			exact[0][7] = pgtype.Timestamptz{Time: activatedAt, Valid: true}
+			exact[0][10] = pgtype.Timestamptz{Time: createdAt.Add(48 * time.Hour), Valid: true}
+			exact[0][11] = pgtype.Timestamptz{Time: createdAt.Add(12 * time.Hour), Valid: true}
+			exact[0][13] = pgtype.Timestamptz{Time: activatedAt, Valid: true}
+			return exact
+		}, want: securitystate.ErrDestinationLifecycleReconciliation},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			live, exact := lifecyclePGRotationAttemptRows("pair")
+			for index := range exact {
+				exact[index] = append([]any(nil), exact[index]...)
+			}
+			events := make([]string, 0, 3)
+			exactRows := &lifecyclePGRows{values: test.mutate(exact), err: test.rowsErr}
+			exactRows.closeHook = func() { events = append(events, "close") }
+			exactRows.errHook = func() { events = append(events, "err") }
+			transaction := &lifecyclePGTransaction{
+				destinationRow: lifecyclePGRow{values: lifecyclePGDestinationValues()},
+				tokenRowSets: []destinationTokenLifecycleRows{
+					&lifecyclePGRows{values: live}, exactRows,
+				},
+				queryErrors: []error{nil, test.queryErr},
+			}
+			transaction.rollbackHook = func() { events = append(events, "rollback") }
+			repository, connection, _ := lifecyclePGRepository(transaction)
+			snapshot, err := repository.InspectRotationAttempt(
+				context.Background(), lifecyclePGAudience(t), lifecyclePGDestination(t),
+				newID, oldID, lifecyclePGNow,
+			)
+			assertLifecyclePGSafe(t, err, test.want, private)
+			if snapshot.Lifecycle().Status() != 0 ||
+				!reflect.DeepEqual(events, []string{"close", "err", "rollback"}) ||
+				!exactRows.closed || exactRows.errCalls != 1 || exactRows.errBeforeClose ||
+				transaction.rollbackCalls != 1 ||
+				transaction.commitCalls != 0 ||
+				(connection.destroys == 1) != test.destroy || (connection.releases == 1) == test.destroy {
+				t.Fatal("malformed exact attempt rows were not closed before rollback")
+			}
+		})
+	}
+}
+
+func TestDestinationTokenLifecycleCombinedReadCauseUsesDirectIdentityOnly(t *testing.T) {
+	private := errors.New(lifecyclePGPrivateMarker)
+	joined := errors.Join(context.Canceled, private)
+	customMatch := lifecyclePGCustomIsError{target: context.Canceled}
+	firstWrapper := fmt.Errorf("first wrapper: %w", context.Canceled)
+	secondWrapper := fmt.Errorf("second wrapper: %w", context.Canceled)
+	sameWrapper := fmt.Errorf("same wrapper: %w", context.Canceled)
+	uncomparable := lifecyclePGUncomparableError("uncomparable")
+	var typedNil *lifecyclePGTypedNilError
+	cycle := &lifecyclePGCyclicError{}
+	cycle.next = cycle
+	deep := error(context.Canceled)
+	for range 128 {
+		deep = fmt.Errorf("deep wrapper: %w", deep)
+	}
+
+	for _, test := range []struct {
+		name        string
+		primary     error
+		terminal    error
+		classify    bool
+		wantDestroy bool
+	}{
+		{name: "canceled then multi-cause", primary: context.Canceled, terminal: joined, classify: true, wantDestroy: true},
+		{name: "multi-cause then canceled", primary: joined, terminal: context.Canceled, classify: true, wantDestroy: true},
+		{name: "canceled then custom Is", primary: context.Canceled, terminal: customMatch, classify: true, wantDestroy: true},
+		{name: "custom Is then canceled", primary: customMatch, terminal: context.Canceled, classify: true, wantDestroy: true},
+		{name: "independent wrappers", primary: firstWrapper, terminal: secondWrapper, classify: true, wantDestroy: true},
+		{name: "same wrapper instance", primary: sameWrapper, terminal: sameWrapper, classify: true, wantDestroy: true},
+		{name: "same multi-cause instance", primary: joined, terminal: joined, classify: true, wantDestroy: true},
+		{name: "same uncomparable value", primary: uncomparable, terminal: uncomparable, classify: true, wantDestroy: true},
+		{name: "typed nil then canceled", primary: typedNil, terminal: context.Canceled, classify: true, wantDestroy: true},
+		{name: "canceled then typed nil", primary: context.Canceled, terminal: typedNil, classify: true, wantDestroy: true},
+		{name: "same typed nil", primary: typedNil, terminal: typedNil, classify: true, wantDestroy: true},
+		{name: "same cyclic wrapper", primary: cycle, terminal: cycle, classify: true, wantDestroy: true},
+		{name: "same over-deep wrapper", primary: deep, terminal: deep, classify: true, wantDestroy: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			combined := lifecycleCombinedReadCause(test.primary, test.terminal)
+			causes, mixed := combined.(interface{ Unwrap() []error })
+			if !mixed || len(causes.Unwrap()) != 2 {
+				t.Fatal("ambiguous read causes were deduplicated")
+			}
+			if !test.classify {
+				return
+			}
+			classified := lifecycleReadError(context.Background(), combined)
+			internal, ok := classified.(lifecycleInternalError)
+			if !ok || !errors.Is(classified, securitystate.ErrDestinationLifecycleUnavailable) ||
+				errors.Is(classified, securitystate.ErrDestinationLifecycleCanceled) ||
+				internal.destroy != test.wantDestroy {
+				t.Fatal("ambiguous read causes did not fail closed")
+			}
+		})
+	}
+
+	for _, direct := range []error{context.Canceled, lifecyclePGLeafError("same direct value")} {
+		combined := lifecycleCombinedReadCause(direct, direct)
+		if combined != direct {
+			t.Fatal("identical direct read cause was not preserved")
+		}
+	}
+	classified := lifecycleReadError(
+		context.Background(), lifecycleCombinedReadCause(context.Canceled, context.Canceled),
+	)
+	internal, ok := classified.(lifecycleInternalError)
+	if !ok || !errors.Is(classified, securitystate.ErrDestinationLifecycleCanceled) || !internal.destroy {
+		t.Fatal("identical direct cancellation lost its single-cause classification")
+	}
+	finiteCancellation := fmt.Errorf("finite cancellation wrapper: %w", context.Canceled)
+	classified = lifecycleReadError(context.Background(), finiteCancellation)
+	internal, ok = classified.(lifecycleInternalError)
+	if !ok || !errors.Is(classified, securitystate.ErrDestinationLifecycleCanceled) || !internal.destroy {
+		t.Fatal("finite single-cause cancellation lost its classification")
+	}
+}
+
+func TestDestinationTokenLifecycleRawDependencyErrorsUseBoundedInterruptionGate(t *testing.T) {
+	private := errors.New(lifecyclePGPrivateMarker)
+	var typedNil *lifecyclePGTypedNilError
+	cycle := &lifecyclePGCyclicError{}
+	cycle.next = cycle
+	deep := error(context.Canceled)
+	for range 128 {
+		deep = fmt.Errorf("deep wrapper: %w", deep)
+	}
+
+	for _, test := range []struct {
+		name    string
+		err     error
+		want    error
+		destroy bool
+	}{
+		{name: "finite ordinary", err: private, want: securitystate.ErrDestinationLifecycleReconciliation},
+		{name: "finite interruption", err: fmt.Errorf("finite interruption: %w", io.EOF), want: securitystate.ErrDestinationLifecycleUnavailable, destroy: true},
+		{name: "mixed", err: errors.Join(context.Canceled, private), want: securitystate.ErrDestinationLifecycleUnavailable, destroy: true},
+		{name: "typed nil", err: typedNil, want: securitystate.ErrDestinationLifecycleUnavailable, destroy: true},
+		{name: "cycle", err: cycle, want: securitystate.ErrDestinationLifecycleUnavailable, destroy: true},
+		{name: "over deep", err: deep, want: securitystate.ErrDestinationLifecycleUnavailable, destroy: true},
+	} {
+		t.Run("begin/"+test.name, func(t *testing.T) {
+			transaction := lifecyclePGTransactionFor()
+			connection := &lifecyclePGConnection{transaction: transaction, beginErr: test.err}
+			repository := newDestinationTokenLifecycleRepository(
+				func(context.Context) (destinationTokenLifecycleConnection, error) {
+					return connection, nil
+				},
+			)
+			err := repository.CreateStagedToken(
+				context.Background(), lifecyclePGCandidate(t), lifecyclePGNow,
+			)
+			assertLifecyclePGSafe(t, err, securitystate.ErrDestinationLifecycleUnavailable, private)
+			if transaction.rollbackCalls != 0 || transaction.commitCalls != 0 ||
+				(connection.destroys == 1) != test.destroy ||
+				(connection.releases == 1) == test.destroy {
+				t.Fatal("unsafe lifecycle begin error reached unbounded interruption traversal")
+			}
+		})
+
+		t.Run("live scan/"+test.name, func(t *testing.T) {
+			transaction := lifecyclePGTransactionFor(
+				lifecyclePGTokenValues(
+					lifecyclePGTestRecordOne, "active", lifecyclePGNow.Add(-time.Minute),
+				),
+			)
+			transaction.tokenRows.(*lifecyclePGRows).scanErr = test.err
+			repository, connection, _ := lifecyclePGRepository(transaction)
+			err := repository.CreateStagedToken(
+				context.Background(), lifecyclePGCandidate(t), lifecyclePGNow,
+			)
+			assertLifecyclePGSafe(t, err, test.want, private)
+			if transaction.rollbackCalls != 1 || transaction.commitCalls != 0 ||
+				(connection.destroys == 1) != test.destroy ||
+				(connection.releases == 1) == test.destroy {
+				t.Fatal("unsafe live-row scan error reached unbounded interruption traversal")
+			}
+		})
+
+		t.Run("exact scan/"+test.name, func(t *testing.T) {
+			live, exact := lifecyclePGRotationAttemptRows("pair")
+			transaction := &lifecyclePGTransaction{
+				destinationRow: lifecyclePGRow{values: lifecyclePGDestinationValues()},
+				tokenRowSets: []destinationTokenLifecycleRows{
+					&lifecyclePGRows{values: live},
+					&lifecyclePGRows{values: exact, scanErr: test.err},
+				},
+			}
+			repository, connection, _ := lifecyclePGRepository(transaction)
+			snapshot, err := repository.InspectRotationAttempt(
+				context.Background(), lifecyclePGAudience(t), lifecyclePGDestination(t),
+				lifecyclePGRecord(t, lifecyclePGTestRecordTwo),
+				lifecyclePGRecord(t, lifecyclePGTestRecordOne), lifecyclePGNow,
+			)
+			assertLifecyclePGSafe(t, err, test.want, private)
+			if snapshot.Lifecycle().Status() != 0 || transaction.rollbackCalls != 1 ||
+				transaction.commitCalls != 0 || (connection.destroys == 1) != test.destroy ||
+				(connection.releases == 1) == test.destroy {
+				t.Fatal("unsafe exact-row scan error reached unbounded interruption traversal")
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "typed nil", err: typedNil},
+		{name: "cycle", err: cycle},
+	} {
+		t.Run("lifecycle inspection begin/"+test.name, func(t *testing.T) {
+			connection := &lifecyclePGConnection{
+				transaction: lifecyclePGTransactionFor(), beginErr: test.err,
+			}
+			repository := newDestinationTokenLifecycleRepository(
+				func(context.Context) (destinationTokenLifecycleConnection, error) {
+					return connection, nil
+				},
+			)
+			_, err := repository.InspectLifecycleState(
+				context.Background(), lifecyclePGAudience(t), lifecyclePGDestination(t), lifecyclePGNow,
+			)
+			assertLifecyclePGSafe(t, err, securitystate.ErrDestinationLifecycleUnavailable, private)
+			if connection.beginCalls != 1 || connection.destroys != 1 || connection.releases != 0 {
+				t.Fatal("unsafe lifecycle inspection begin error reused its connection")
+			}
+		})
+
+		t.Run("attempt inspection begin/"+test.name, func(t *testing.T) {
+			connection := &lifecyclePGConnection{
+				transaction: lifecyclePGTransactionFor(), beginErr: test.err,
+			}
+			repository := newDestinationTokenLifecycleRepository(
+				func(context.Context) (destinationTokenLifecycleConnection, error) {
+					return connection, nil
+				},
+			)
+			_, err := repository.InspectRotationAttempt(
+				context.Background(), lifecyclePGAudience(t), lifecyclePGDestination(t),
+				lifecyclePGRecord(t, lifecyclePGTestRecordTwo),
+				lifecyclePGRecord(t, lifecyclePGTestRecordOne), lifecyclePGNow,
+			)
+			assertLifecyclePGSafe(t, err, securitystate.ErrDestinationLifecycleUnavailable, private)
+			if connection.beginCalls != 1 || connection.destroys != 1 || connection.releases != 0 {
+				t.Fatal("unsafe attempt inspection begin error reused its connection")
+			}
+		})
 	}
 }
 
@@ -646,7 +1354,7 @@ func TestDestinationTokenLifecycleFailureClassificationAndCleanup(t *testing.T) 
 		rollbackBound bool
 	}{
 		{name: "state query", configure: func(transaction *lifecyclePGTransaction) { transaction.queryErr = private }, want: securitystate.ErrDestinationLifecycleUnavailable, rollbackBound: true},
-		{name: "insert ordinary", configure: func(transaction *lifecyclePGTransaction) { transaction.execErrors = []error{private} }, want: securitystate.ErrDestinationLifecycleUnavailable, rollbackBound: true},
+		{name: "insert ordinary", configure: func(transaction *lifecyclePGTransaction) { transaction.execErrors = []error{private} }, want: securitystate.ErrDestinationLifecycleOutcomeUnknown, destroy: true, outcome: true, rollbackBound: true},
 		{name: "insert interrupted", configure: func(transaction *lifecyclePGTransaction) { transaction.execErrors = []error{io.EOF} }, want: securitystate.ErrDestinationLifecycleUnavailable, destroy: true, rollbackBound: true},
 		{name: "rows zero", configure: func(transaction *lifecyclePGTransaction) {
 			transaction.execTags = []pgconn.CommandTag{pgconn.NewCommandTag("INSERT 0")}
@@ -810,6 +1518,49 @@ func TestDestinationTokenLifecycleAcquireBeginCancellationAndConstraintSafety(t 
 		t.Fatal("pre-canceled lifecycle request began a transaction")
 	}
 
+	var typedNilTransaction *lifecyclePGTransaction
+	for _, nilTransaction := range []struct {
+		name        string
+		transaction destinationTokenLifecycleTransaction
+	}{
+		{name: "nil"},
+		{name: "typed nil", transaction: typedNilTransaction},
+	} {
+		t.Run(nilTransaction.name+" transaction plus concurrent cancellation", func(t *testing.T) {
+			concurrent, concurrentCancel := context.WithCancel(context.Background())
+			connection := &lifecyclePGConnection{transaction: nilTransaction.transaction, beginHook: concurrentCancel}
+			repository := newDestinationTokenLifecycleRepository(func(context.Context) (destinationTokenLifecycleConnection, error) { return connection, nil })
+			err := repository.CreateStagedToken(concurrent, candidate, lifecyclePGNow)
+			assertLifecyclePGSafe(t, err, securitystate.ErrDestinationLifecycleUnavailable, nil)
+			if connection.beginCalls != 1 || connection.destroys != 1 || connection.releases != 0 {
+				t.Fatal("nil transaction plus concurrent cancellation was not treated as an invariant failure")
+			}
+		})
+	}
+
+	concurrent, concurrentCancel := context.WithCancel(context.Background())
+	transaction = lifecyclePGTransactionFor()
+	transaction.execErrors = []error{errors.Join(securitystate.ErrDestinationLifecycleConflict, private)}
+	transaction.execHook = concurrentCancel
+	repository, connection, _ = lifecyclePGRepository(transaction)
+	err = repository.CreateStagedToken(concurrent, candidate, lifecyclePGNow)
+	assertLifecyclePGSafe(t, err, securitystate.ErrDestinationLifecycleOutcomeUnknown, private)
+	if transaction.rollbackCalls != 1 || connection.destroys != 1 || connection.releases != 0 {
+		t.Fatal("concurrent cancellation downgraded ambiguous lifecycle mutation")
+	}
+
+	concurrent, concurrentCancel = context.WithCancel(context.Background())
+	transaction = lifecyclePGTransactionFor()
+	transaction.destinationRow = lifecyclePGRow{
+		err: errors.Join(securitystate.ErrDestinationLifecycleReconciliation, private), hook: concurrentCancel,
+	}
+	repository, connection, _ = lifecyclePGRepository(transaction)
+	err = repository.CreateStagedToken(concurrent, candidate, lifecyclePGNow)
+	assertLifecyclePGSafe(t, err, securitystate.ErrDestinationLifecycleUnavailable, private)
+	if transaction.rollbackCalls != 1 {
+		t.Fatal("concurrent cancellation downgraded ambiguous lifecycle read")
+	}
+
 	for _, constraint := range []struct {
 		name string
 		want error
@@ -832,7 +1583,7 @@ func TestDestinationTokenLifecycleAcquireBeginCancellationAndConstraintSafety(t 
 	transaction.execErrors = []error{joined}
 	repository, _, _ = lifecyclePGRepository(transaction)
 	err = repository.CreateStagedToken(context.Background(), candidate, lifecyclePGNow)
-	assertLifecyclePGSafe(t, err, securitystate.ErrDestinationLifecycleUnavailable, private)
+	assertLifecyclePGSafe(t, err, securitystate.ErrDestinationLifecycleOutcomeUnknown, private)
 }
 
 func TestDestinationTokenLifecycleSQLScopeAndNoForbiddenBehavior(t *testing.T) {

@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"errors"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/duj4/ms-oncall-gateway/internal/securitystate"
@@ -56,6 +58,7 @@ type OpaqueDestinationResolver struct {
 }
 
 var _ securitystate.DestinationResolver = (*OpaqueDestinationResolver)(nil)
+var _ securitystate.DestinationRotationTokenIdentifier = (*OpaqueDestinationResolver)(nil)
 
 func NewOpaqueDestinationResolver(
 	pool Pool,
@@ -145,27 +148,82 @@ func (resolver *OpaqueDestinationResolver) Resolve(
 	if audienceErr != nil || parsedAudience != expectedAudience {
 		return securitystate.DestinationID{}, safeError(ErrDestinationResolverIntegrity, "destination resolution input")
 	}
-	if cancellation := contextSentinel(ctx, nil); cancellation != nil {
+	if cancellation := destinationResolverContextSentinel(ctx, nil); cancellation != nil {
 		return securitystate.DestinationID{}, safeError(cancellation, "destination resolution canceled")
 	}
 
-	candidates, err := resolver.verifierCandidates(ctx, expectedAudience, rawToken)
+	matches, err := resolver.matchingDestinationTokens(ctx, expectedAudience, rawToken)
 	if err != nil {
 		return securitystate.DestinationID{}, err
 	}
+	if len(matches) == 0 || !matches[0].UsableAt(now) {
+		return securitystate.DestinationID{}, securitystate.ErrDestinationNotFound
+	}
+	return matches[0].DestinationID(), nil
+}
 
+func (resolver *OpaqueDestinationResolver) IdentifyRotationToken(
+	ctx context.Context,
+	expectedAudience securitystate.GatewayAudienceID,
+	expectedDestination securitystate.DestinationID,
+	rawToken securitystate.OpaqueDestinationToken,
+	newActiveRecordID securitystate.DestinationTokenRecordID,
+	oldRetiringRecordID securitystate.DestinationTokenRecordID,
+	now time.Time,
+) (securitystate.DestinationTokenRotationTokenIdentity, error) {
+	if resolver == nil || resolver.acquire == nil || nilInterface(resolver.keySource) ||
+		len(resolver.keyIDs) < 1 || len(resolver.keyIDs) > 2 || nilInterface(ctx) ||
+		expectedAudience.IsZero() || expectedDestination.IsZero() ||
+		newActiveRecordID.IsZero() || oldRetiringRecordID.IsZero() ||
+		newActiveRecordID == oldRetiringRecordID || now.IsZero() {
+		return 0, safeError(ErrDestinationResolverIntegrity, "rotation token identification input")
+	}
+	if cancellation := destinationResolverContextSentinel(ctx, nil); cancellation != nil {
+		return 0, safeError(cancellation, "rotation token identification canceled")
+	}
+
+	matches, err := resolver.matchingDestinationTokens(ctx, expectedAudience, rawToken)
+	if err != nil {
+		return 0, err
+	}
+	if len(matches) == 0 {
+		return securitystate.DestinationTokenRotationTokenNeither, nil
+	}
+	match := matches[0]
+	if match.AudienceID() != expectedAudience || match.DestinationID() != expectedDestination {
+		return securitystate.DestinationTokenRotationTokenNeither, nil
+	}
+	switch match.RecordID() {
+	case newActiveRecordID:
+		return securitystate.DestinationTokenRotationTokenNew, nil
+	case oldRetiringRecordID:
+		return securitystate.DestinationTokenRotationTokenOld, nil
+	default:
+		return securitystate.DestinationTokenRotationTokenNeither, nil
+	}
+}
+
+func (resolver *OpaqueDestinationResolver) matchingDestinationTokens(
+	ctx context.Context,
+	expectedAudience securitystate.GatewayAudienceID,
+	rawToken securitystate.OpaqueDestinationToken,
+) ([]securitystate.DestinationToken, error) {
+	candidates, err := resolver.verifierCandidates(ctx, expectedAudience, rawToken)
+	if err != nil {
+		return nil, err
+	}
 	connection, err := resolver.acquire(ctx)
 	if err != nil {
 		if !nilInterface(connection) {
 			connection.Destroy()
 		}
-		if cancellation := contextSentinel(ctx, err); cancellation != nil {
-			return securitystate.DestinationID{}, safeError(cancellation, "destination resolution connection")
+		if cancellation := destinationResolverContextSentinel(ctx, err); cancellation != nil {
+			return nil, safeError(cancellation, "destination token lookup connection")
 		}
-		return securitystate.DestinationID{}, safeError(ErrDestinationResolverUnavailable, "destination resolution connection")
+		return nil, safeError(ErrDestinationResolverUnavailable, "destination token lookup connection")
 	}
 	if nilInterface(connection) {
-		return securitystate.DestinationID{}, safeError(ErrDestinationResolverUnavailable, "destination resolution connection")
+		return nil, safeError(ErrDestinationResolverUnavailable, "destination token lookup connection")
 	}
 
 	finished := false
@@ -184,11 +242,10 @@ func (resolver *OpaqueDestinationResolver) Resolve(
 	matches := make([]securitystate.DestinationToken, 0, len(candidates))
 	integrityFailure := false
 	for _, candidate := range candidates {
-		if cancellation := contextSentinel(ctx, nil); cancellation != nil {
+		if cancellation := destinationResolverContextSentinel(ctx, nil); cancellation != nil {
 			finish(true)
-			return securitystate.DestinationID{}, safeError(cancellation, "destination token query")
+			return nil, safeError(cancellation, "destination token lookup query")
 		}
-
 		candidateVerifier := candidate.verifier.Bytes()
 		record := destinationTokenRecord{}
 		row := connection.QueryRow(
@@ -200,21 +257,20 @@ func (resolver *OpaqueDestinationResolver) Resolve(
 		)
 		if nilInterface(row) {
 			finish(true)
-			return securitystate.DestinationID{}, safeError(ErrDestinationResolverUnavailable, "destination token query")
+			return nil, safeError(ErrDestinationResolverUnavailable, "destination token lookup query")
 		}
 		err = row.Scan(record.destinations()...)
-		if cancellation := contextSentinel(ctx, err); cancellation != nil {
+		if cancellation := destinationResolverContextSentinel(ctx, err); cancellation != nil {
 			finish(true)
-			return securitystate.DestinationID{}, safeError(cancellation, "destination token query")
+			return nil, safeError(cancellation, "destination token lookup query")
 		}
 		if err == pgx.ErrNoRows {
 			continue
 		}
 		if err != nil {
 			finish(isConnectionInterruption(err))
-			return securitystate.DestinationID{}, safeError(ErrDestinationResolverUnavailable, "destination token query")
+			return nil, safeError(ErrDestinationResolverUnavailable, "destination token lookup query")
 		}
-
 		token, recordErr := record.token(expectedAudience, candidate)
 		if recordErr != nil {
 			integrityFailure = true
@@ -223,18 +279,15 @@ func (resolver *OpaqueDestinationResolver) Resolve(
 		matches = append(matches, token)
 	}
 
-	if cancellation := contextSentinel(ctx, nil); cancellation != nil {
+	if cancellation := destinationResolverContextSentinel(ctx, nil); cancellation != nil {
 		finish(true)
-		return securitystate.DestinationID{}, safeError(cancellation, "destination token query")
+		return nil, safeError(cancellation, "destination token lookup query")
 	}
 	finish(false)
 	if integrityFailure || len(matches) > 1 {
-		return securitystate.DestinationID{}, safeError(ErrDestinationResolverIntegrity, "destination token record")
+		return nil, safeError(ErrDestinationResolverIntegrity, "destination token lookup record")
 	}
-	if len(matches) == 0 || !matches[0].UsableAt(now) {
-		return securitystate.DestinationID{}, securitystate.ErrDestinationNotFound
-	}
-	return matches[0].DestinationID(), nil
+	return matches, nil
 }
 
 type destinationVerifierCandidate struct {
@@ -251,7 +304,7 @@ func (resolver *OpaqueDestinationResolver) verifierCandidates(
 	unavailable := false
 	for _, keyID := range resolver.keyIDs {
 		key, err := resolver.keySource.DestinationVerifierKey(ctx, audience, keyID)
-		if cancellation := contextSentinel(ctx, err); cancellation != nil {
+		if cancellation := destinationResolverContextSentinel(ctx, err); cancellation != nil {
 			return nil, safeError(cancellation, "destination verifier key")
 		}
 		if err != nil {
@@ -274,6 +327,41 @@ func (resolver *OpaqueDestinationResolver) verifierCandidates(
 		return nil, safeError(ErrDestinationResolverUnavailable, "destination verifier key")
 	}
 	return candidates, nil
+}
+
+func destinationResolverContextSentinel(ctx context.Context, err error) error {
+	if err != nil {
+		if destinationResolverSingleCauseMatches(err, context.Canceled) {
+			return context.Canceled
+		}
+		if destinationResolverSingleCauseMatches(err, context.DeadlineExceeded) {
+			return context.DeadlineExceeded
+		}
+		return nil
+	}
+	if !nilInterface(ctx) && ctx.Err() == context.Canceled {
+		return context.Canceled
+	}
+	if !nilInterface(ctx) && ctx.Err() == context.DeadlineExceeded {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+func destinationResolverSingleCauseMatches(err, target error) bool {
+	for current, depth := err, 0; current != nil && depth < 64; depth++ {
+		if nilInterface(current) {
+			return false
+		}
+		if _, ambiguous := current.(interface{ Unwrap() []error }); ambiguous {
+			return false
+		}
+		if reflect.TypeOf(current).Comparable() && current == target {
+			return true
+		}
+		current = errors.Unwrap(current)
+	}
+	return false
 }
 
 // computeDestinationTokenVerifier remains as the package-local test seam used

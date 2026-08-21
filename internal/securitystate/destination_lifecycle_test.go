@@ -99,18 +99,35 @@ type lifecycleTestRepository struct {
 	mu       sync.Mutex
 	calls    []lifecycleRepositoryCall
 	err      error
+	hook     func()
 	snapshot DestinationLifecycleSnapshot
 }
 
 func (repository *lifecycleTestRepository) add(call lifecycleRepositoryCall) error {
 	repository.mu.Lock()
-	defer repository.mu.Unlock()
 	repository.calls = append(repository.calls, call)
-	return repository.err
+	err, hook := repository.err, repository.hook
+	repository.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return err
 }
 
 func (repository *lifecycleTestRepository) CreateStagedToken(_ context.Context, candidate StagedTokenCandidate, now time.Time) error {
 	return repository.add(lifecycleRepositoryCall{operation: "create", candidate: candidate, now: now})
+}
+
+func (repository *lifecycleTestRepository) CreateRotationStagedToken(
+	_ context.Context,
+	command CreateRotationStagedTokenCommand,
+) error {
+	return repository.add(lifecycleRepositoryCall{
+		operation: "create-rotation",
+		candidate: command.Candidate(),
+		first:     command.ExpectedActiveRecordID(),
+		now:       command.Now(),
+	})
 }
 
 func (repository *lifecycleTestRepository) ActivateInitialToken(_ context.Context, audience GatewayAudienceID, destination DestinationID, staged DestinationTokenRecordID, now time.Time) error {
@@ -417,6 +434,140 @@ func TestDestinationLifecycleCreateGoldenAndOneTimeReturn(t *testing.T) {
 	}
 }
 
+func TestDestinationLifecycleRotationCreateBindsExpectedActive(t *testing.T) {
+	audience := mustLifecycleAudience(t)
+	destination := mustLifecycleDestinationID(t)
+	expectedActive := mustLifecycleRecordID(t, lifecycleTestRecordOneText)
+	newRecord := mustLifecycleRecordID(t, lifecycleTestRecordTwoText)
+	currentBytes := lifecycleEntropy(1)
+	currentBytes[0] ^= 0xff
+	currentToken, err := ParseOpaqueDestinationToken(
+		opaqueTokenPrefix + base64.RawURLEncoding.EncodeToString(currentBytes),
+	)
+	if err != nil {
+		t.Fatal("lifecycle current token setup failed")
+	}
+	repository := &lifecycleTestRepository{}
+	service, _, keys := newLifecycleTestService(
+		t,
+		repository,
+		bytes.NewReader(lifecycleEntropy(1)),
+		&lifecycleTestRecordGenerator{records: []DestinationTokenRecordID{newRecord}},
+	)
+
+	created, err := service.CreateRotationStagedToken(
+		context.Background(), audience, destination, expectedActive, currentToken,
+	)
+	if err != nil || created.RecordID() != newRecord || created.Token().Value() != lifecycleGoldenToken {
+		t.Fatal("lifecycle rotation staged token creation failed")
+	}
+	calls := repository.callSnapshot()
+	if len(calls) != 1 || calls[0].operation != "create-rotation" ||
+		calls[0].first != expectedActive || calls[0].candidate.RecordID() != newRecord ||
+		calls[0].now != lifecycleTestNow || keys.calls != 1 {
+		t.Fatal("lifecycle rotation create did not bind the exact active record")
+	}
+	command, err := NewCreateRotationStagedTokenCommand(
+		calls[0].candidate, expectedActive, calls[0].now,
+	)
+	if err != nil || fmt.Sprintf("%v", command) != "[redacted]" {
+		t.Fatal("lifecycle rotation create command was invalid or not redacted")
+	}
+	if invalid, err := NewCreateRotationStagedTokenCommand(
+		calls[0].candidate, newRecord, calls[0].now,
+	); err != ErrDestinationLifecycleInvalid || invalid.ExpectedActiveRecordID() != (DestinationTokenRecordID{}) {
+		t.Fatal("lifecycle rotation create accepted the candidate as its own expected active record")
+	}
+}
+
+func TestDestinationLifecycleRotationCreateRejectsCurrentRawTokenReuseAcrossVerifierKeys(t *testing.T) {
+	audience := mustLifecycleAudience(t)
+	destination := mustLifecycleDestinationID(t)
+	expectedActive := mustLifecycleRecordID(t, lifecycleTestRecordOneText)
+	newRecord := mustLifecycleRecordID(t, lifecycleTestRecordTwoText)
+	currentToken, err := ParseOpaqueDestinationToken(lifecycleGoldenToken)
+	if err != nil {
+		t.Fatal("lifecycle current token setup failed")
+	}
+	activeKey := mustLifecycleKey(t)
+	historicalMaterial := make([]byte, 32)
+	for index := range historicalMaterial {
+		historicalMaterial[index] = byte(index + 1)
+	}
+	historicalKey, err := NewDestinationVerifierKey(historicalMaterial)
+	if err != nil {
+		t.Fatal("lifecycle historical verifier key setup failed")
+	}
+	activeVerifier, err := ComputeDestinationTokenVerifier(audience, currentToken, activeKey)
+	if err != nil {
+		t.Fatal("lifecycle active-key verifier setup failed")
+	}
+	historicalVerifier, err := ComputeDestinationTokenVerifier(audience, currentToken, historicalKey)
+	if err != nil || historicalVerifier == activeVerifier {
+		t.Fatal("lifecycle historical-key verifier setup did not model key rollover")
+	}
+
+	for _, test := range []struct {
+		name            string
+		currentVerifier TokenVerifier
+	}{
+		{name: "current token under active verifier key", currentVerifier: activeVerifier},
+		{name: "current token under historical verifier key", currentVerifier: historicalVerifier},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.currentVerifier.IsZero() {
+				t.Fatal("lifecycle current verifier precondition failed")
+			}
+			repository := &lifecycleTestRepository{}
+			service, _, keys := newLifecycleTestService(
+				t,
+				repository,
+				bytes.NewReader(lifecycleEntropy(1)),
+				&lifecycleTestRecordGenerator{records: []DestinationTokenRecordID{newRecord}},
+			)
+			created, err := service.CreateRotationStagedToken(
+				context.Background(), audience, destination, expectedActive, currentToken,
+			)
+			if err != ErrDestinationLifecycleConflict || !created.RecordID().IsZero() ||
+				!created.Token().IsZero() || keys.calls != 0 || len(repository.callSnapshot()) != 0 {
+				t.Fatal("lifecycle rotation raw-token collision reached verifier or persistence")
+			}
+		})
+	}
+}
+
+func TestDestinationLifecycleRotationCreateOutcomeUnknownPreservesOnlyBoundRecord(t *testing.T) {
+	audience := mustLifecycleAudience(t)
+	destination := mustLifecycleDestinationID(t)
+	expectedActive := mustLifecycleRecordID(t, lifecycleTestRecordOneText)
+	newRecord := mustLifecycleRecordID(t, lifecycleTestRecordTwoText)
+	currentBytes := lifecycleEntropy(1)
+	currentBytes[0] ^= 0xff
+	currentToken, err := ParseOpaqueDestinationToken(
+		opaqueTokenPrefix + base64.RawURLEncoding.EncodeToString(currentBytes),
+	)
+	if err != nil {
+		t.Fatal("lifecycle current token setup failed")
+	}
+	repository := &lifecycleTestRepository{err: ErrDestinationLifecycleOutcomeUnknown}
+	service, _, _ := newLifecycleTestService(
+		t,
+		repository,
+		bytes.NewReader(lifecycleEntropy(1)),
+		&lifecycleTestRecordGenerator{records: []DestinationTokenRecordID{newRecord}},
+	)
+
+	created, err := service.CreateRotationStagedToken(
+		context.Background(), audience, destination, expectedActive, currentToken,
+	)
+	calls := repository.callSnapshot()
+	if err != ErrDestinationLifecycleOutcomeUnknown || created.RecordID() != newRecord ||
+		!created.Token().IsZero() || len(calls) != 1 || calls[0].operation != "create-rotation" ||
+		calls[0].first != expectedActive {
+		t.Fatal("lifecycle ambiguous rotation create lost its bound record or exposed token material")
+	}
+}
+
 func TestDestinationLifecycleCreateFailuresReturnNoPartialToken(t *testing.T) {
 	private := errors.New(lifecyclePrivateMarker)
 	audience := mustLifecycleAudience(t)
@@ -424,27 +575,31 @@ func TestDestinationLifecycleCreateFailuresReturnNoPartialToken(t *testing.T) {
 	recordID := mustLifecycleRecordID(t, lifecycleTestRecordOneText)
 
 	for _, test := range []struct {
-		name      string
-		random    io.Reader
-		generator *lifecycleTestRecordGenerator
-		keyErr    error
-		repoErr   error
-		want      error
-		repoCalls int
+		name       string
+		random     io.Reader
+		generator  *lifecycleTestRecordGenerator
+		keyErr     error
+		repoErr    error
+		want       error
+		repoCalls  int
+		wantRecord bool
 	}{
 		{name: "record generator", random: bytes.NewReader(lifecycleEntropy(1)), generator: &lifecycleTestRecordGenerator{err: private}, want: ErrDestinationLifecycleUnavailable},
 		{name: "random failure", random: lifecycleErrorReader{err: private}, generator: &lifecycleTestRecordGenerator{records: []DestinationTokenRecordID{recordID}}, want: ErrDestinationLifecycleUnavailable},
 		{name: "random short read", random: bytes.NewReader(make([]byte, 31)), generator: &lifecycleTestRecordGenerator{records: []DestinationTokenRecordID{recordID}}, want: ErrDestinationLifecycleUnavailable},
 		{name: "key source", random: bytes.NewReader(lifecycleEntropy(1)), generator: &lifecycleTestRecordGenerator{records: []DestinationTokenRecordID{recordID}}, keyErr: private, want: ErrDestinationLifecycleUnavailable},
 		{name: "repository conflict", random: bytes.NewReader(lifecycleEntropy(1)), generator: &lifecycleTestRecordGenerator{records: []DestinationTokenRecordID{recordID}}, repoErr: fmt.Errorf("wrapped: %w", ErrDestinationLifecycleConflict), want: ErrDestinationLifecycleConflict, repoCalls: 1},
-		{name: "outcome unknown", random: bytes.NewReader(lifecycleEntropy(1)), generator: &lifecycleTestRecordGenerator{records: []DestinationTokenRecordID{recordID}}, repoErr: fmt.Errorf("wrapped: %w", ErrDestinationLifecycleOutcomeUnknown), want: ErrDestinationLifecycleOutcomeUnknown, repoCalls: 1},
+		{name: "outcome unknown", random: bytes.NewReader(lifecycleEntropy(1)), generator: &lifecycleTestRecordGenerator{records: []DestinationTokenRecordID{recordID}}, repoErr: fmt.Errorf("wrapped: %w", ErrDestinationLifecycleOutcomeUnknown), want: ErrDestinationLifecycleOutcomeUnknown, repoCalls: 1, wantRecord: true},
+		{name: "unrecognized mutation", random: bytes.NewReader(lifecycleEntropy(1)), generator: &lifecycleTestRecordGenerator{records: []DestinationTokenRecordID{recordID}}, repoErr: private, want: ErrDestinationLifecycleOutcomeUnknown, repoCalls: 1, wantRecord: true},
+		{name: "joined mutation", random: bytes.NewReader(lifecycleEntropy(1)), generator: &lifecycleTestRecordGenerator{records: []DestinationTokenRecordID{recordID}}, repoErr: errors.Join(ErrDestinationLifecycleConflict, private), want: ErrDestinationLifecycleOutcomeUnknown, repoCalls: 1, wantRecord: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			repository := &lifecycleTestRepository{err: test.repoErr}
 			service, _, keys := newLifecycleTestService(t, repository, test.random, test.generator)
 			keys.err = test.keyErr
 			created, err := service.CreateStagedToken(context.Background(), audience, destination)
-			if !errors.Is(err, test.want) || !created.RecordID().IsZero() || !created.Token().IsZero() || len(repository.callSnapshot()) != test.repoCalls {
+			if !errors.Is(err, test.want) || (created.RecordID() == recordID) != test.wantRecord ||
+				!created.Token().IsZero() || len(repository.callSnapshot()) != test.repoCalls {
 				t.Fatal("lifecycle create failure returned a partial result or wrong classification")
 			}
 			if strings.Contains(err.Error(), lifecyclePrivateMarker) || errors.Is(err, private) {
@@ -465,8 +620,13 @@ func TestDestinationLifecycleOperationsUseOneClockSnapshot(t *testing.T) {
 	if err := service.ActivateInitialToken(context.Background(), audience, destination, first); err != nil {
 		t.Fatal("lifecycle initial activation dispatch failed")
 	}
-	if err := service.ActivateRotation(context.Background(), audience, destination, first, second); err != nil {
+	activation, err := service.ActivateRotation(context.Background(), audience, destination, first, second)
+	if err != nil {
 		t.Fatal("lifecycle rotation activation dispatch failed")
+	}
+	if activation.RetirementDeadline() != lifecycleTestNow.Add(6*time.Hour) || !activation.valid() ||
+		fmt.Sprintf("%v", activation) != "[redacted]" {
+		t.Fatal("lifecycle rotation activation did not return the committed deadline receipt")
 	}
 	if err := service.AbortStagedToken(context.Background(), audience, destination, first); err != nil {
 		t.Fatal("lifecycle staged abort dispatch failed")
@@ -497,11 +657,94 @@ func TestDestinationLifecycleOperationsUseOneClockSnapshot(t *testing.T) {
 	}
 }
 
+func TestDestinationLifecycleActivationUsesOneDatabasePrecisionSnapshot(t *testing.T) {
+	audience := mustLifecycleAudience(t)
+	destination := mustLifecycleDestinationID(t)
+	staged := mustLifecycleRecordID(t, lifecycleTestRecordOneText)
+	oldActive := mustLifecycleRecordID(t, lifecycleTestRecordTwoText)
+	repository := &lifecycleTestRepository{}
+	service, clock, _ := newLifecycleTestService(
+		t,
+		repository,
+		bytes.NewReader(lifecycleEntropy(1)),
+		&lifecycleTestRecordGenerator{records: []DestinationTokenRecordID{staged}},
+	)
+	rawNow := lifecycleTestNow.Add(999 * time.Nanosecond)
+	clock.now = rawNow
+	service.overlapDuration = 6*time.Hour + 500*time.Nanosecond
+
+	receipt, err := service.ActivateRotation(
+		context.Background(), audience, destination, staged, oldActive,
+	)
+	if err != nil {
+		t.Fatal("lifecycle sub-microsecond rotation activation failed")
+	}
+	expectedActivatedAt := rawNow.Truncate(time.Microsecond)
+	expectedDeadline := rawNow.Add(service.overlapDuration).Truncate(time.Microsecond)
+	calls := repository.callSnapshot()
+	if len(calls) != 1 || calls[0].operation != "activate-rotation" ||
+		!calls[0].now.Equal(expectedActivatedAt) || !calls[0].deadline.Equal(expectedDeadline) ||
+		!receipt.ActivatedAt().Equal(calls[0].now) ||
+		!receipt.RetirementDeadline().Equal(calls[0].deadline) ||
+		receipt.ActivatedAt().After(rawNow) ||
+		receipt.ActivatedAt().Nanosecond()%int(time.Microsecond) != 0 ||
+		receipt.RetirementDeadline().Nanosecond()%int(time.Microsecond) != 0 {
+		t.Fatal("lifecycle activation command and receipt did not share canonical database precision")
+	}
+}
+
+func TestDestinationTokenRotationActivationReceiptBounds(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		activated time.Time
+		deadline  time.Time
+		valid     bool
+	}{
+		{name: "zero activation", deadline: lifecycleTestNow.Add(time.Hour)},
+		{name: "zero deadline", activated: lifecycleTestNow},
+		{name: "equal deadline", activated: lifecycleTestNow, deadline: lifecycleTestNow},
+		{name: "sub-microsecond activation", activated: lifecycleTestNow.Add(time.Nanosecond), deadline: lifecycleTestNow.Add(time.Hour)},
+		{name: "sub-microsecond deadline", activated: lifecycleTestNow, deadline: lifecycleTestNow.Add(time.Hour + time.Nanosecond)},
+		{name: "over maximum", activated: lifecycleTestNow, deadline: lifecycleTestNow.Add(MaximumRetiringOverlapDuration + time.Nanosecond)},
+		{name: "maximum", activated: lifecycleTestNow, deadline: lifecycleTestNow.Add(MaximumRetiringOverlapDuration), valid: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			receipt, err := NewDestinationTokenRotationActivationReceipt(test.activated, test.deadline)
+			if test.valid {
+				if err != nil || !receipt.valid() || receipt.ActivatedAt() != test.activated ||
+					receipt.RetirementDeadline() != test.deadline {
+					t.Fatal("valid activation receipt was rejected")
+				}
+				return
+			}
+			if err != ErrDestinationLifecycleInvalid || receipt.valid() ||
+				!receipt.ActivatedAt().IsZero() || !receipt.RetirementDeadline().IsZero() {
+				t.Fatal("invalid activation receipt was accepted or returned partial metadata")
+			}
+		})
+	}
+}
+
 func TestDestinationLifecycleInputCancellationAndSafeErrors(t *testing.T) {
 	audience := mustLifecycleAudience(t)
 	destination := mustLifecycleDestinationID(t)
 	record := mustLifecycleRecordID(t, lifecycleTestRecordOneText)
 	private := errors.New(lifecyclePrivateMarker)
+	repositoryWithActivationError := &lifecycleTestRepository{err: private}
+	serviceWithActivationError, _, _ := newLifecycleTestService(
+		t,
+		repositoryWithActivationError,
+		bytes.NewReader(lifecycleEntropy(1)),
+		&lifecycleTestRecordGenerator{records: []DestinationTokenRecordID{record}},
+	)
+	activation, activationErr := serviceWithActivationError.ActivateRotation(
+		context.Background(), audience, destination, record,
+		mustLifecycleRecordID(t, lifecycleTestRecordTwoText),
+	)
+	if activationErr != ErrDestinationLifecycleOutcomeUnknown || activation.valid() ||
+		!activation.RetirementDeadline().IsZero() {
+		t.Fatal("failed rotation activation returned deadline metadata")
+	}
 
 	for _, test := range []struct {
 		name string
@@ -509,7 +752,7 @@ func TestDestinationLifecycleInputCancellationAndSafeErrors(t *testing.T) {
 		err  error
 		want error
 	}{
-		{name: "unknown dependency", ctx: context.Background(), err: private, want: ErrDestinationLifecycleUnavailable},
+		{name: "unknown dependency", ctx: context.Background(), err: private, want: ErrDestinationLifecycleOutcomeUnknown},
 		{name: "repository cancellation", ctx: context.Background(), err: context.Canceled, want: ErrDestinationLifecycleCanceled},
 		{name: "repository deadline", ctx: context.Background(), err: context.DeadlineExceeded, want: ErrDestinationLifecycleDeadline},
 		{name: "fixed repository cancellation", ctx: context.Background(), err: fmt.Errorf("outer: %w", ErrDestinationLifecycleCanceled), want: ErrDestinationLifecycleCanceled},
@@ -525,6 +768,32 @@ func TestDestinationLifecycleInputCancellationAndSafeErrors(t *testing.T) {
 		})
 	}
 
+	t.Run("concurrent cancellation does not downgrade dependency errors", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		repository := &lifecycleTestRepository{
+			err:  errors.Join(ErrDestinationLifecycleConflict, private),
+			hook: cancel,
+		}
+		service, _, _ := newLifecycleTestService(t, repository, bytes.NewReader(lifecycleEntropy(1)), &lifecycleTestRecordGenerator{records: []DestinationTokenRecordID{record}})
+		if err := service.ActivateInitialToken(ctx, audience, destination, record); err != ErrDestinationLifecycleOutcomeUnknown {
+			t.Fatal("concurrent cancellation downgraded ambiguous lifecycle mutation")
+		}
+
+		ctx, cancel = context.WithCancel(context.Background())
+		repository = &lifecycleTestRepository{err: errors.Join(ErrDestinationLifecycleConflict, private), hook: cancel}
+		service, _, _ = newLifecycleTestService(t, repository, bytes.NewReader(lifecycleEntropy(1)), &lifecycleTestRecordGenerator{records: []DestinationTokenRecordID{record}})
+		if _, err := service.InspectLifecycleState(ctx, audience, destination); err != ErrDestinationLifecycleUnavailable {
+			t.Fatal("concurrent cancellation downgraded ambiguous lifecycle inspection")
+		}
+
+		ctx, cancel = context.WithCancel(context.Background())
+		repository = &lifecycleTestRepository{err: ErrDestinationLifecycleReconciliation, hook: cancel}
+		service, _, _ = newLifecycleTestService(t, repository, bytes.NewReader(lifecycleEntropy(1)), &lifecycleTestRecordGenerator{records: []DestinationTokenRecordID{record}})
+		if _, err := service.InspectLifecycleState(ctx, audience, destination); err != ErrDestinationLifecycleReconciliation {
+			t.Fatal("concurrent cancellation obscured exact lifecycle reconciliation")
+		}
+	})
+
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
 	repository := &lifecycleTestRepository{}
@@ -532,7 +801,7 @@ func TestDestinationLifecycleInputCancellationAndSafeErrors(t *testing.T) {
 	if err := service.ActivateInitialToken(canceled, audience, destination, record); !errors.Is(err, ErrDestinationLifecycleCanceled) || len(repository.callSnapshot()) != 0 || clock.callCount() != 0 {
 		t.Fatal("pre-canceled lifecycle operation reached dependencies")
 	}
-	if err := service.ActivateRotation(context.Background(), audience, destination, record, record); !errors.Is(err, ErrDestinationLifecycleInvalid) {
+	if activation, err := service.ActivateRotation(context.Background(), audience, destination, record, record); !errors.Is(err, ErrDestinationLifecycleInvalid) || activation.valid() {
 		t.Fatal("same-record lifecycle pair was accepted")
 	}
 	if err := service.FinalizeRotation(context.Background(), audience, destination, record, mustLifecycleRecordID(t, lifecycleTestRecordTwoText), RotationCompletionReason(99)); !errors.Is(err, ErrDestinationLifecycleInvalid) {
@@ -541,7 +810,7 @@ func TestDestinationLifecycleInputCancellationAndSafeErrors(t *testing.T) {
 
 	repository = &lifecycleTestRepository{err: errors.Join(ErrDestinationLifecycleConflict, private)}
 	service, _, _ = newLifecycleTestService(t, repository, bytes.NewReader(lifecycleEntropy(1)), &lifecycleTestRecordGenerator{records: []DestinationTokenRecordID{record}})
-	if err := service.ActivateInitialToken(context.Background(), audience, destination, record); !errors.Is(err, ErrDestinationLifecycleUnavailable) || errors.Is(err, ErrDestinationLifecycleConflict) || errors.Is(err, private) {
+	if err := service.ActivateInitialToken(context.Background(), audience, destination, record); !errors.Is(err, ErrDestinationLifecycleOutcomeUnknown) || errors.Is(err, ErrDestinationLifecycleConflict) || errors.Is(err, private) {
 		t.Fatal("ambiguous multi-cause lifecycle error did not fail closed")
 	}
 	for _, test := range []struct {
@@ -572,12 +841,12 @@ func TestDestinationLifecycleInputCancellationAndSafeErrors(t *testing.T) {
 		{
 			name:       "outer wrapped ambiguous conflict",
 			dependency: fmt.Errorf("outer: %w", errors.Join(ErrDestinationLifecycleConflict, private)),
-			want:       ErrDestinationLifecycleUnavailable, unwanted: ErrDestinationLifecycleConflict,
+			want:       ErrDestinationLifecycleOutcomeUnknown, unwanted: ErrDestinationLifecycleConflict,
 		},
 		{
 			name:       "joined same conflict sentinel",
 			dependency: errors.Join(ErrDestinationLifecycleConflict, ErrDestinationLifecycleConflict),
-			want:       ErrDestinationLifecycleUnavailable, unwanted: ErrDestinationLifecycleConflict,
+			want:       ErrDestinationLifecycleOutcomeUnknown, unwanted: ErrDestinationLifecycleConflict,
 		},
 		{
 			name:       "joined outcome unknown",
@@ -587,7 +856,8 @@ func TestDestinationLifecycleInputCancellationAndSafeErrors(t *testing.T) {
 		{
 			name:       "joined context cancellation",
 			dependency: errors.Join(context.Canceled, private),
-			want:       ErrDestinationLifecycleCanceled,
+			want:       ErrDestinationLifecycleOutcomeUnknown,
+			unwanted:   ErrDestinationLifecycleCanceled,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
